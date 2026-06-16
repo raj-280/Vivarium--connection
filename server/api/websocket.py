@@ -327,7 +327,38 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
-
+            elif msg_type in ("command", "CAPTURE"):
+              rack_id = msg.get("rack_id")
+              command  = msg.get("command", "CAPTURE" if msg_type == "CAPTURE" else "")
+              if rack_id and command:
+                  from db.database import get_db
+                  from services.command_handler import CommandValidationError, handle_command
+                  db = next(get_db())
+                  try:
+                      result = handle_command(
+                          rack_id=rack_id,
+                          raw_command=command,
+                          user_id=conn.user_id,
+                          db=db,
+                      )
+                      await websocket.send_text(json.dumps({
+                          "type": "command_ack",
+                          "rack_id": rack_id,
+                          "command": command,
+                          "outcome": result.outcome,
+                      }))
+                  except CommandValidationError as exc:
+                      await websocket.send_text(json.dumps({
+                          "type": "error",
+                          "detail": str(exc),
+                      }))
+                  finally:
+                      db.close()
+              else:
+                  await websocket.send_text(json.dumps({
+                      "type": "error",
+                      "detail": "command and rack_id are required.",
+                  }))                                         
             else:
                 # Unknown message types are silently ignored (forward compat)
                 logger.debug("WS unknown msg type=%r from user=%s", msg_type, user_id)
