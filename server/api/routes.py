@@ -732,3 +732,31 @@ async def query_machine_limits(
         "limit_c_mm": rack.limit_c_mm,
         "note": "M799 published — limits will update via MQTT within seconds if Pi is online.",
     }
+# ===========================================================================
+# GET /racks  — list provisioned racks (admin or operator)
+# ===========================================================================
+
+class RackSummary(BaseModel):
+    id: str
+    display_name: Optional[str] = None
+    location: Optional[str] = None
+    mqtt_status: Optional[str] = None
+    camera_status: Optional[str] = None
+
+@router.get("/racks", response_model=list[RackSummary], tags=["rack"])
+async def list_racks(
+    current_user: CurrentUser = Depends(require_browser_user),
+    db: Session = Depends(get_db),
+):
+    """Return all provisioned racks so the frontend rack-picker can populate."""
+    rows = db.query(Rack).all()
+    return [
+        RackSummary(
+            id=r.id,
+            display_name=getattr(r, "display_name", None),
+            location=getattr(r, "location", None),
+            mqtt_status=getattr(r, "mqtt_status", None),
+            camera_status=getattr(r, "camera_status", None),
+        )
+        for r in rows
+    ]

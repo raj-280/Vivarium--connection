@@ -50,6 +50,8 @@ export default function LiveControl() {
   const {
     sendCommand,
     activeRackId,
+    subscribeRack,
+    auth,
     gantryPosition,
     piOnline,
     wsStatus,
@@ -61,7 +63,17 @@ export default function LiveControl() {
   const [targetRow, setTargetRow] = useState(0);
   const [targetCol, setTargetCol] = useState(0);
   const stepMm = appConfig.jogStepsMm[stepIndex];
-
+  // Rack picker
+  const [racks, setRacks] = useState<{ id: string; location?: string | null }[]>([]);
+  useEffect(() => {
+    if (!auth?.token) return;
+    fetch(`${appConfig.apiBaseUrl}/racks`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    })
+      .then(r => r.ok ? r.json() : [])
+      .then(setRacks)
+      .catch(() => {});
+  }, [auth?.token]);
   const isConnected = wsStatus === 'connected';
   const canCommand  = isConnected && userRole !== 'viewer' && !!activeRackId;
 
@@ -124,6 +136,21 @@ export default function LiveControl() {
           </p>
         </div>
         <div className="flex items-center gap-2 w-full sm:w-auto">
+          {/* Rack picker */}
+          {racks.length > 0 && (
+            <select
+              className="text-xs border border-gray-300 rounded px-2 py-1 bg-white text-slate-700 focus:outline-none focus:border-blue-500"
+              value={activeRackId ?? ''}
+              onChange={e => { if (e.target.value) subscribeRack(e.target.value); }}
+            >
+              <option value="">Select rack…</option>
+              {racks.map(r => (
+                <option key={r.id} value={r.id}>
+                  {r.id}{r.location ? ` — ${r.location}` : ''}
+                </option>
+              ))}
+            </select>
+          )}
           <Badge
             variant={statusVariant}
             className={cn(
@@ -138,8 +165,8 @@ export default function LiveControl() {
               {activeRackId}
             </span>
           )}
+         </div>
         </div>
-      </div>
 
       <div className="grid gap-4 lg:grid-cols-12">
 
