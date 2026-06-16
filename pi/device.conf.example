@@ -1,0 +1,77 @@
+# =============================================================================
+# Vivarium Gantry System — Pi device configuration (Section 2.2)
+# =============================================================================
+# Real path: /etc/gantry/device.conf, mode 600 (owner read/write only).
+# Written automatically by pi/provisioner.py on first boot (Section 5.3) —
+# you should not normally need to hand-edit this file on a real Pi.
+#
+# ── Local testing ────────────────────────────────────────────────────────
+# pi/config/settings.py reads /etc/gantry/device.conf by default. To test
+# without root, copy this file somewhere writable and point at it:
+#
+#     cp pi/device.conf.example /tmp/device.conf
+#     export GANTRY_DEVICE_CONF=/tmp/device.conf
+#
+# No code changes are needed to go back to the real path — just unset
+# GANTRY_DEVICE_CONF on the actual Pi.
+# =============================================================================
+
+[identity]
+# This Pi's logical rack ID, e.g. rack-047. Assigned by /provision
+# (Section 4.6 / 5.3).
+device_id = rack-test
+
+# CPU serial is read from /proc/cpuinfo during provisioning and is NOT
+# stored here after provisioning completes (Section 2.2) — left blank.
+cpu_serial =
+
+[server]
+# Base URL of the FastAPI server (used by provisioner.py and, later,
+# camera_handler.py for /presign — Section 5.3 / 5.4).
+server_host = http://localhost:8000
+
+# Credentials issued by POST /provision (Section 4.6 / 5.3).
+presign_api_key =
+mqtt_password =
+rtsp_password =
+
+[mqtt]
+# Mirrors the server's MQTT_BROKER / MQTT_PORT (Section 2.1).
+broker_host = localhost
+broker_port = 1883
+
+# [PROD ONLY] — inert locally (Section 9).
+mqtt_use_tls = false
+ca_cert_path =
+
+[serial]
+# Arduino link configuration (Section 2.2 / 6).
+# For the Stage 7 socat test, point this at one end of the virtual pair —
+# see the test instructions for the exact device name.
+serial_port = /dev/ttyACM0
+serial_baud = 115200
+serial_timeout_s = 5
+serial_retry_count = 1
+
+[capture]
+# Local-first capture directory (Section 5.4 / 12). Used when
+# S3_ENABLED=false on the server (current default).
+capture_dir = ./captures
+
+# batch_upload_enabled stays false until BOTH this flag AND S3_ENABLED on
+# the server are true (Section 5.4 / 12) — config-only S3 upgrade path.
+batch_upload_enabled = false
+
+# true on a real Pi (/tmp is RAM-backed tmpfs). false for local dev/testing
+# where /tmp is a normal disk-backed directory.
+tmp_is_tmpfs = false
+
+[streaming]
+# go2rtc RTSP port (Section 5.6). Stream name should match device_id so it
+# lines up with the server's stream registry (Section 8).
+go2rtc_port = 8554
+go2rtc_stream_name = rack-test
+
+[scan]
+# How often the Pi pings the server to extend a scan lock (Section 4.3 / 4.7).
+scan_lock_keepalive_interval_s = 30

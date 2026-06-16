@@ -1,0 +1,25 @@
+# =============================================================================
+# vivarium-provisioner.service (Section 5.1 / 5.3)
+# =============================================================================
+# Pre-start unit: runs provisioner.py, which exits immediately (milliseconds)
+# if /etc/gantry/device.conf already exists. Only does real work on first boot.
+#
+# provisioner.py itself is implemented in Stage 8 — this unit file is created
+# now to match the Section 5.1 folder structure, but is not enabled/started
+# until Stage 8.
+# =============================================================================
+
+[Unit]
+Description=Vivarium Gantry — First-boot provisioner
+Before=vivarium-bridge.service
+ConditionPathExists=!/etc/gantry/device.conf
+
+[Service]
+Type=oneshot
+User=gantry
+WorkingDirectory=/opt/vivarium/pi
+ExecStart=/usr/bin/python3 /opt/vivarium/pi/provisioner.py
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

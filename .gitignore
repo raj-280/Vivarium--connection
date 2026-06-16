@@ -1,0 +1,89 @@
+# =============================================================================
+# Vivarium Gantry System — root .gitignore
+# =============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env_folder/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+# Keep .env.example files — they document required variables without real values.
+.env
+server/.env
+remix_-allentown\ _frontend/.env
+remix_-allentown\ _frontend/package.json
+remix_-allentown\ _frontend/package-lock.json
+# ── Database (SQLite runtime files) ───────────────────────────────────────────
+
+*.db-shm
+*.db-wal
+
+# ── Mosquitto runtime data ────────────────────────────────────────────────────
+mosquitto_data/
+
+# ── Pi device config (contains credentials — never commit the real one) ───────
+# device.conf.example and device.conf.test are safe to commit.
+
+
+# ── Capture / image files ─────────────────────────────────────────────────────
+captures/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+
+# ── go2rtc binary (downloaded at deploy time, not committed) ──────────────────
+pi/go2rtc/go2rtc
+pi/go2rtc/go2rtc_linux_arm64
+pi/go2rtc/*.yaml
+!pi/go2rtc/*.example.yaml
+
+# ── Node.js / Frontend ────────────────────────────────────────────────────────
+node_modules/
+remix_-allentown\ _frontend/node_modules/
+remix_-allentown\ _frontend/dist/
+remix_-allentown\ _frontend/build/
+remix_-allentown\ _frontend/.cache/
+remix_-allentown\ _frontend/.react-router/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS / editor files ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Keep Dockerfiles; ignore local-only override composes if you add any.
+docker-compose.override.yml
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+.socat_pids
+*.bak
+*.tmp

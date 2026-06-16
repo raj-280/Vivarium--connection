@@ -1,0 +1,38 @@
+# =============================================================================
+# Vivarium Gantry System — server dependencies
+# =============================================================================
+# Install: pip install -r requirements.txt
+# Python 3.11+ required.
+# =============================================================================
+
+# --- Core framework ----------------------------------------------------------
+fastapi==0.115.5
+uvicorn[standard]==0.32.1          # includes websockets + httptools
+
+# --- Configuration -----------------------------------------------------------
+pydantic-settings==2.6.1
+
+# --- Database ----------------------------------------------------------------
+sqlalchemy==2.0.36
+
+# --- Auth --------------------------------------------------------------------
+passlib[bcrypt]==1.7.4             # bcrypt password hashing (users table)
+python-jose[cryptography]==3.3.0   # JWT creation / validation
+
+# --- MQTT --------------------------------------------------------------------
+paho-mqtt==2.1.0
+
+# --- Rate limiting -----------------------------------------------------------
+slowapi==0.1.9
+
+# --- Task scheduling (auto-scan engine) --------------------------------------
+apscheduler==3.10.4
+
+# --- Async file I/O (image delivery, local_path writes) ----------------------
+aiofiles==24.1.0
+
+# --- HTTP client (presign callbacks, go2rtc health checks) -------------------
+httpx==0.27.2
+
+# --- Optional: Redis (only needed when CACHE_BACKEND=redis) ------------------
+# redis==5.2.0

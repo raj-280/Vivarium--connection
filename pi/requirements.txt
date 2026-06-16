@@ -1,0 +1,11 @@
+# =============================================================================
+# Vivarium Gantry System — Pi requirements (Section 5.1)
+# =============================================================================
+# Stage 7 (bridge core):
+paho-mqtt==1.6.1
+pyserial==3.5
+
+# Later stages (camera/streaming) will add, e.g.:
+#   requests           — provisioner.py (Stage 8), camera_handler.py presign calls
+#   picamera2 / opencv — camera_handler.py (Stage 10)
+# Not added yet, per the "no placeholder code for future stages" rule.

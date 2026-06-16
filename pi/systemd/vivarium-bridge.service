@@ -1,0 +1,47 @@
+[Unit]
+Description=Vivarium Gantry Bridge (Pi MQTT ↔ Serial ↔ Arduino)
+Documentation=https://github.com/yourorg/vivarium
+# Must not start until the provisioner has written device.conf (Stage 8).
+After=network-online.target vivarium-provisioner.service
+Wants=network-online.target
+Requires=vivarium-provisioner.service
+
+[Service]
+Type=simple
+User=gantry
+Group=gantry
+# Adjust WorkingDirectory if deployed elsewhere — the bridge imports from
+# config/ and services/ relative to this directory.
+WorkingDirectory=/opt/vivarium/pi
+
+# Both launch styles work; -m pi.bridge is cleaner once pi/ is a package.
+# Swap to `python3 bridge.py` if running without the parent package on sys.path.
+ExecStart=/usr/bin/python3 -m pi.bridge
+
+Restart=on-failure
+RestartSec=5s
+# Cap restart attempts; if the bridge can't connect to serial or MQTT after
+# 10 tries (50s), systemd marks it as failed and an admin needs to investigate.
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+# Structured logging: all output goes to the journal (journalctl -u vivarium-bridge).
+StandardOutput=journal
+StandardError=journal
+
+# Allow access to /etc/gantry/device.conf (mode 600) as user gantry.
+# NoNewPrivileges keeps the service from escalating.
+NoNewPrivileges=true
+
+# Environment — only set what bridge.py actually reads from the environment.
+# Device config path (GANTRY_DEVICE_CONF) is NOT set here; it defaults to
+# /etc/gantry/device.conf, which provisioner.py has already written.
+Environment=PYTHONUNBUFFERED=1
+# Override log level without editing this file:
+#   sudo systemctl edit vivarium-bridge
+#   [Service]
+#   Environment=GANTRY_LOG_LEVEL=DEBUG
+Environment=GANTRY_LOG_LEVEL=INFO
+
+[Install]
+WantedBy=multi-user.target

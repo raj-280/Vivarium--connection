@@ -1,0 +1,132 @@
+# =============================================================================
+# Vivarium Gantry System — go2rtc configuration (Section 5.1 / 5.6 / 8)
+# =============================================================================
+#
+# This is a TEMPLATE. The provisioner (pi/provisioner.py, Section 5.3) writes
+# the real go2rtc config during first-boot by substituting the placeholders
+# below. On an already-provisioned Pi, the live file lives at:
+#
+#     /etc/gantry/go2rtc.yaml    (mode 640, owner root, group gantry)
+#
+# Managed by the vivarium-camera.service systemd unit (see
+# pi/systemd/vivarium-camera.service).
+#
+# ── Placeholders ─────────────────────────────────────────────────────────────
+#   {{DEVICE_ID}}     — this Pi's device_id (from device.conf [identity]),
+#                       e.g. rack-047. Also used as the stream name so it
+#                       always matches racks.id on the server (Section 8).
+#   {{RTSP_PASSWORD}} — issued by POST /provision (Section 5.3), stored in
+#                       device.conf [server] rtsp_password (mode 600).
+#   {{GO2RTC_PORT}}   — from device.conf [streaming] go2rtc_port (default 8554).
+#   {{PI_IP}}         — filled in by provisioner.py with the Pi's outbound IP;
+#                       only needed by the server-side go2rtc pull list entry,
+#                       not in this file. Listed here for documentation only.
+#
+# ── Local testing (no real Pi camera) ────────────────────────────────────────
+# Replace the `exec:libcamera-vid …` source line with a test pattern:
+#
+#     streams:
+#       "rack-test":
+#         - "ffmpeg:testsrc=size=640x480:rate=15#video=h264#audio=false"
+#
+# This requires ffmpeg on PATH. The stream will be available at:
+#     rtsp://rack-test:{RTSP_PASSWORD}@localhost:8554/rack-test
+#
+# See the local-testing notes at the bottom of this file for the full
+# end-to-end check procedure.
+# =============================================================================
+
+streams:
+  # Stream name MUST equal device_id (Section 8).
+  # The server's go2rtc relay pulls from:
+  #   rtsp://{DEVICE_ID}:{RTSP_PASSWORD}@{PI_IP}:{GO2RTC_PORT}/{DEVICE_ID}
+  "{{DEVICE_ID}}":
+    # ── Real Pi Camera Module (CSI) ──────────────────────────────────────────
+    # libcamera-vid: continuous H.264 stream from the Pi Camera Module 3
+    # (or v2/HQ). Flags:
+    #   -t 0         — run indefinitely (no timeout)
+    #   --inline     — embed SPS/PPS headers so the stream is self-describing
+    #   --width/height — match or lower than the camera's native resolution
+    #   --framerate  — 15fps is plenty for vivarium monitoring
+    #   -o -         — pipe to stdout so go2rtc reads it
+    - "exec:libcamera-vid -t 0 --inline --width 1280 --height 720 --framerate 15 -o -"
+
+    # ── USB camera fallback ──────────────────────────────────────────────────
+    # Uncomment and comment out the libcamera-vid line above to use a USB
+    # camera at /dev/video0 instead of the CSI port. Requires v4l2 tools.
+    # - "ffmpeg:device=/dev/video0#video=h264"
+
+rtsp:
+  # RTSP server listen address — bound to 0.0.0.0 so the server can pull.
+  # [PROD ONLY] UFW on this Pi restricts port {{GO2RTC_PORT}} to the server's
+  # IP only (Section 9 Layer 2D). Locally, no firewall rules are required.
+  listen: ":{{GO2RTC_PORT}}"
+
+  # Digest authentication — username is the device_id, password is the
+  # rtsp_password issued during provisioning (Section 5.3).
+  # The server-side go2rtc pull URL format:
+  #   rtsp://{{DEVICE_ID}}:{{RTSP_PASSWORD}}@{{PI_IP}}:{{GO2RTC_PORT}}/{{DEVICE_ID}}
+  username: "{{DEVICE_ID}}"
+  password: "{{RTSP_PASSWORD}}"
+
+api:
+  # go2rtc REST API — bound to localhost only on the Pi.
+  # go2rtc_health.py (Section 5.6) checks GET /api/streams at this URL.
+  # [PROD ONLY] This port must NOT be exposed externally.
+  listen: "127.0.0.1:1984"
+
+log:
+  # Structured logging for the Pi journal.
+  level: info
+  format: text
+
+# =============================================================================
+# [PROD ONLY] Section 9 Layer 2D hardening
+# =============================================================================
+# The following are notes only — they are applied outside this config file:
+#
+#   • go2rtc runs as the `gantry` non-root user (ExecStart in the systemd unit).
+#   • UFW on the Pi: ufw allow from <SERVER_IP> to any port {{GO2RTC_PORT}}
+#   • TLS certificate rotation tracked in the `certificates` DB table (3.10);
+#     rolled out by the Ansible playbook referenced in ANSIBLE_INVENTORY_PATH.
+#   • RTSP digest auth credential rotated via /provision re-run or a dedicated
+#     admin API (planned for Stage 15).
+#
+# =============================================================================
+# Local end-to-end test procedure (no real Pi / no real camera)
+# =============================================================================
+#
+# 1. Install go2rtc (https://github.com/AlexxIT/go2rtc/releases).
+#    On Windows/Linux: download the binary and place it on PATH.
+#
+# 2. Create a local test config (save as /tmp/go2rtc-test.yaml):
+#
+#      streams:
+#        rack-test:
+#          - "ffmpeg:testsrc=size=640x480:rate=15#video=h264#audio=false"
+#      rtsp:
+#        listen: ":8554"
+#        username: "rack-test"
+#        password: "test-rtsp-password"
+#      api:
+#        listen: "127.0.0.1:1984"
+#
+# 3. Run go2rtc:
+#      go2rtc -config /tmp/go2rtc-test.yaml
+#
+# 4. Confirm the RTSP stream is available:
+#      ffplay rtsp://rack-test:test-rtsp-password@localhost:8554/rack-test
+#
+# 5. Confirm the HTTP health API responds:
+#      curl http://localhost:1984/api/streams
+#      # Should return JSON with "rack-test" key
+#
+# 6. Start the server with GO2RTC_INTERNAL_URL=http://localhost:1984 in .env.
+#    Acquire a capture lock via POST /rack/rack-test/lock (lock_type=capture).
+#    Observe the stream_url WebSocket message:
+#      { "type": "stream_url", "data": { "rack_id": "rack-test",
+#        "url": "/camera/api/webrtc?src=rack-test" } }
+#
+# 7. Open a browser at /camera/api/webrtc?src=rack-test to verify the
+#    WebRTC feed loads (requires Nginx proxy or go2rtc running on port 80).
+# =============================================================================

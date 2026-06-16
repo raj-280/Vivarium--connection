@@ -1,0 +1,6 @@
+{
+  "name": "Remix: Allentown App 2 - Edge Control",
+  "description": "App 2 – Edge Control \u0026 Operations Application for Allentown AI-Driven Rack Inspection System. Enables local inspection workflow execution, rack config, and cloud synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
