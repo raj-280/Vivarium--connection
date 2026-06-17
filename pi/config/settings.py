@@ -1,27 +1,6 @@
 """
 pi/config/settings.py
 
-Single source of truth for every configuration key listed in Section 2.2 of
-the implementation plan.  Every other module imports `settings` from here;
-nothing reads the config file or os.environ directly.
-
-The config file is INI-style (configparser), matching /etc/gantry/device.conf,
-mode 600, as described in Section 2.2 / 5.3.
-
-── Local testing override ───────────────────────────────────────────────────
-Section 2.2 specifies the file lives at /etc/gantry/device.conf — writing
-there normally requires root.  For local development and the socat-based
-Stage 7 test, set the environment variable:
-
-    GANTRY_DEVICE_CONF=/path/to/your/device.conf
-
-and settings.py will read from that path instead.  No code change is needed
-to go back to the real path — just unset the env var (or don't set it) on
-the actual Pi.
-
-If neither the override env var nor the real file exists, settings.py falls
-back to a small set of local-dev defaults so bridge.py can still start (e.g.
-to run provisioner.py for the first time, per Section 5.3).
 """
 
 from __future__ import annotations

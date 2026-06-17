@@ -43,7 +43,7 @@ from db.database import create_tables, db_session
 from db.models import AuditLog, ImageRecord, Rack
 from core.locking import extend_lock, release_lock, start_lock_sweep_task
 from core.state import gantry_state
-from middleware.csrf import CSRFMiddleware
+# from middleware.csrf import CSRFMiddleware
 from middleware.rate_limit import limiter
 from services.mqtt_client import mqtt_client
 from services.cache import cache
@@ -649,7 +649,7 @@ def create_app() -> FastAPI:
     )
 
     # CSRF — double-submit cookie (no-op locally when CSRF_ENABLED=False)
-    app.add_middleware(CSRFMiddleware)
+    # app.add_middleware(CSRFMiddleware)
 
     # slowapi rate limiter
     app.state.limiter = limiter
