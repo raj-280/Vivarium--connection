@@ -171,7 +171,18 @@ class SerialHandler:
             # short poll interval for the reader thread
         )
         # Give the Arduino a moment to settle after the port opens
-         
+        if "ttyACM" in port:
+            logger.info(
+                "ttyACM port detected — closing immediately and waiting 9 s "
+                "for Arduino Mega bootloader + USB re-enumeration…"
+            )
+            self._serial.close()
+            time.sleep(9.0)          # Caterina timeout 8 s + 1 s margin
+            self._serial.open()
+        else:
+            # FTDI/ttyUSB: no re-enumeration, shorter wait is fine
+            time.sleep(2.0)
+    
         time.sleep(3.0)
         self._serial.reset_input_buffer() 
  
