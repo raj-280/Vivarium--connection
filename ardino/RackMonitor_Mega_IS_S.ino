@@ -139,7 +139,7 @@ M704   ; Enter camera In and Out position
        ; M707 I75
        ; M707 O5
 
-M705   ; Query command for number of rows and columns 
+M705   ; Query command for number of rows and columns
 
 M706   ; Query command for X and Y pitch values
 
@@ -149,18 +149,19 @@ M708   ; Query command for camera In and Out positions
 
 M709   ; Query command for M701 to M704 values
 
+M799  ; Query command for the complete machine limits in one response.
+
 M500   ; Save to EEPROM
 
 M501   ; LOAD (or auto-load on startup)
 */
 
-
-#include <AccelStepper.h>      // AccelStepper library for non-blocking stepper control
-#include <math.h>              // Math utilities (fabsf, lroundf)
+#include <AccelStepper.h> // AccelStepper library for non-blocking stepper control
+#include <math.h>         // Math utilities (fabsf, lroundf)
 #include <EEPROM.h>
 
-
-struct Settings {
+struct Settings
+{
   int maxRows;
   int maxCols;
 
@@ -173,72 +174,63 @@ struct Settings {
   float camIn;
   float camOut;
 
-  uint16_t magic;   // used to validate EEPROM
+  uint16_t magic; // used to validate EEPROM
 };
 const int EEPROM_ADDR = 0;
 const uint16_t EEPROM_MAGIC = 0xBEEF;
 
-
-
-
-
 // ---------------- PIN MAP ----------------
 
 // X axis (horizontal)
-#define X_STEP_PIN      22      // Step pin for X axis driver
-#define X_DIR_PIN       23      // Direction pin for X axis driver
-#define X_EN_PIN        24      // Enable pin for X axis driver
-#define X_MIN_PIN       40      // X-axis minimum (home) limit switch pin
-#define X_MAX_PIN       -1      // X-axis maximum limit switch (not installed)
+#define X_STEP_PIN 22 // Step pin for X axis driver
+#define X_DIR_PIN 23  // Direction pin for X axis driver
+#define X_EN_PIN 24   // Enable pin for X axis driver
+#define X_MIN_PIN 40  // X-axis minimum (home) limit switch pin
+#define X_MAX_PIN -1  // X-axis maximum limit switch (not installed)
 
 // Y axis - dual motors with dual TOP limit switches at home
-#define Y1_STEP_PIN     26      // Step pin for Y motor 1
-#define Y1_DIR_PIN      27      // Direction pin for Y motor 1
-#define Y1_EN_PIN       28      // Enable pin for Y motor 1
-#define Y1_TOP_PIN      30      // Top limit switch for Y motor 1 (active LOW)
+#define Y1_STEP_PIN 26 // Step pin for Y motor 1
+#define Y1_DIR_PIN 27  // Direction pin for Y motor 1
+#define Y1_EN_PIN 28   // Enable pin for Y motor 1
+#define Y1_TOP_PIN 30  // Top limit switch for Y motor 1 (active LOW)
 
-#define Y2_STEP_PIN     29      // Step pin for Y motor 2
-#define Y2_DIR_PIN      33      // Direction pin for Y motor 2
-#define Y2_EN_PIN       34      // Enable pin for Y motor 2
-#define Y2_TOP_PIN      31      // Top limit switch for Y motor 2 (active LOW)
+#define Y2_STEP_PIN 29 // Step pin for Y motor 2
+#define Y2_DIR_PIN 33  // Direction pin for Y motor 2
+#define Y2_EN_PIN 34   // Enable pin for Y motor 2
+#define Y2_TOP_PIN 31  // Top limit switch for Y motor 2 (active LOW)
 
 // Camera C axis (retract home)
-#define C_STEP_PIN      35      // Step pin for camera axis
-#define C_DIR_PIN       36      // Direction pin for camera axis
-#define C_EN_PIN        37      // Enable pin for camera axis
-#define C_MIN_PIN       41      // Camera retract (home) limit switch
-#define C_MAX_PIN       -1      // Camera max switch (not installed)
+#define C_STEP_PIN 35 // Step pin for camera axis
+#define C_DIR_PIN 36  // Direction pin for camera axis
+#define C_EN_PIN 37   // Enable pin for camera axis
+#define C_MIN_PIN 41  // Camera retract (home) limit switch
+#define C_MAX_PIN -1  // Camera max switch (not installed)
 
 // Operator button + LED
-#define HOME_BTN_PIN    38      // Manual home button (normally open to GND)
-#define STATUS_LED_PIN  39      // Status LED output pin
+#define HOME_BTN_PIN 38   // Manual home button (normally open to GND)
+#define STATUS_LED_PIN 39 // Status LED output pin
+
+// ---------------- Simulation LEDs ----------------
+
+#define ENABLE_LED_SIMULATION true
+
+#define SIM_X_POS_LED 42
+#define SIM_X_NEG_LED 43
+
+#define SIM_Y_POS_LED 44
+#define SIM_Y_NEG_LED 45
+
+#define SIM_C_POS_LED 46
+#define SIM_C_NEG_LED 47
+
+#define HOME_LED_PIN 48
+#define ESTOP_LED_PIN 49
 
 // Enable logic (DM556 typically active LOW)Y1_TOP_PINvois
-const bool ENABLE_ACTIVE_LOW = true;   // TRUE if enable pin is active LOW
+const bool ENABLE_ACTIVE_LOW = true; // TRUE if enable pin is active LOW
 
 // Limit logic (NO switches to GND with INPUT_PULLUP)
-const bool LIMIT_ACTIVE_LOW = true;    // TRUE if LOW means switch triggered
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+const bool LIMIT_ACTIVE_LOW = true; // TRUE if LOW means switch triggered
 
 // ---------------- CALIBRATION ----------------
 
@@ -246,24 +238,24 @@ const bool LIMIT_ACTIVE_LOW = true;    // TRUE if LOW means switch triggered
 const float MOTOR_STEPS_PER_REV = 200.0f;
 
 // Microstepping settings (must match driver DIP switches); 36teeth/2.25in=16; number of teeth (36) divide by pinion diameter (2.25in)
-const float MICROSTEPS_X = 16.0f;      // X-axis microsteps (float)
-const float MICROSTEPS_Y = 16.0f;      // Y-axis microsteps (float)
-const float MICROSTEPS_C = 16.0f;      // Camera axis microsteps (float)
+const float MICROSTEPS_X = 16.0f; // X-axis microsteps (float)
+const float MICROSTEPS_Y = 16.0f; // Y-axis microsteps (float)
+const float MICROSTEPS_C = 16.0f; // Camera axis microsteps (float)
 
-// Rack & pinion parameters (36 tooth gear, 16 DP rack); 
+// Rack & pinion parameters (36 tooth gear, 16 DP rack);
 // the DP stands for Diametral Pitch. It’s a standard way to describe the size of gear teeth in imperial units.
-const float DP_X = 16.0f;              // Diametral pitch
-const float TEETH_X = 36.0f;           // Number of teeth on pinion
+const float DP_X = 16.0f;    // Diametral pitch
+const float TEETH_X = 36.0f; // Number of teeth on pinion
 
 // Linear travel per motor revolution (converted to mm)
 const float TRAVEL_PER_REV_X_MM =
-  (TEETH_X * (3.1415926535f / DP_X)) * 25.4f;   //25.4mm = 1 inch
+    (TEETH_X * (3.1415926535f / DP_X)) * 25.4f; // 25.4mm = 1 inch
 
 // Y-axis uses same rack & pinion geometry
 const float DP_Y = 16.0f;
 const float TEETH_Y = 36.0f;
 const float TRAVEL_PER_REV_Y_MM =
-  (TEETH_Y * (3.1415926535f / DP_Y)) * 25.4f/20;   //(TEETH_Y * (3.1415926535f / DP_Y)) * 25.4f;
+    (TEETH_Y * (3.1415926535f / DP_Y)) * 25.4f / 20; //(TEETH_Y * (3.1415926535f / DP_Y)) * 25.4f;
 
 // Camera axis leadscrew (T6x1 = 1 mm per revolution)
 const float LEAD_C_MM = 1.0f;
@@ -274,58 +266,57 @@ float stepsPerMM_Y = 0.0f;
 float stepsPerMM_C = 0.0f;
 
 // Convert motor + microstepping + mechanics into steps/mm
-static inline float calcStepsPerMM(float micro, float travel_per_rev_mm) {
+static inline float calcStepsPerMM(float micro, float travel_per_rev_mm)
+{
   return (MOTOR_STEPS_PER_REV * micro) / travel_per_rev_mm;
 }
 
 // Calculate steps/mm for all axes
-void calcStepsPerMM_All() {
+void calcStepsPerMM_All()
+{
   stepsPerMM_X = calcStepsPerMM(MICROSTEPS_X, TRAVEL_PER_REV_X_MM);
   stepsPerMM_Y = calcStepsPerMM(MICROSTEPS_Y, TRAVEL_PER_REV_Y_MM);
   stepsPerMM_C = calcStepsPerMM(MICROSTEPS_C, LEAD_C_MM);
 }
 
-
-
-
-//Motion limits, homing config, grid, and state
-// ---------------- Motion limits (conservative starters) ----------------
+// Motion limits, homing config, grid, and state
+//  ---------------- Motion limits (conservative starters) ----------------
 
 // Maximum linear speed for X axis in mm/s
-const float MAX_SPEED_X_MM_S = 400.0f;    //const float MAX_SPEED_X_MM_S = 150.0f;
+const float MAX_SPEED_X_MM_S = 400.0f; // const float MAX_SPEED_X_MM_S = 150.0f;
 
 // Maximum linear speed for Y axis in mm/s
-const float MAX_SPEED_Y_MM_S = 5000.0f;    //const float MAX_SPEED_Y_MM_S = 100.0f;
+const float MAX_SPEED_Y_MM_S = 5000.0f; // const float MAX_SPEED_Y_MM_S = 100.0f;
 
 // Maximum linear speed for camera axis in mm/s
 const float MAX_SPEED_C_MM_S = 40.0f;
 
 // Acceleration for X axis in mm/s²
-const float ACCEL_X_MM_S2    = 1500.0f;    //const float ACCEL_X_MM_S2    = 400.0f;
+const float ACCEL_X_MM_S2 = 1500.0f; // const float ACCEL_X_MM_S2    = 400.0f;
 
 // Acceleration for Y axis in mm/s²
-const float ACCEL_Y_MM_S2    = 2500.0f;    //const float ACCEL_Y_MM_S2    = 300.0f;
+const float ACCEL_Y_MM_S2 = 2500.0f; // const float ACCEL_Y_MM_S2    = 300.0f;
 
 // Acceleration for camera axis in mm/s²
-const float ACCEL_C_MM_S2    = 200.0f;
+const float ACCEL_C_MM_S2 = 200.0f;
 
 // Homing directions: -1 means move toward MIN switch
-const int   HOMING_DIR_X = -1; // Move left toward X_MIN
-const int   HOMING_DIR_Y = -1; // Move upward toward Y_TOP switches
-const int   HOMING_DIR_C = -1; // Retract camera toward C_MIN
+const int HOMING_DIR_X = -1; // Move left toward X_MIN
+const int HOMING_DIR_Y = -1; // Move upward toward Y_TOP switches
+const int HOMING_DIR_C = -1; // Retract camera toward C_MIN
 
 // Homing speeds, backoff distances, and slow approach speeds
-const float HOMING_SPEED_X_MM_S = 50.0f;   // Fast homing speed for X
-const float HOMING_BACKOFF_X_MM = 0.0f;    // Back away distance after hit
-const float HOMING_SLOW_X_MM_S  = 10.0f;   // Slow re-approach speed
+const float HOMING_SPEED_X_MM_S = 50.0f; // Fast homing speed for X
+const float HOMING_BACKOFF_X_MM = 0.0f;  // Back away distance after hit
+const float HOMING_SLOW_X_MM_S = 10.0f;  // Slow re-approach speed
 
-const float HOMING_SPEED_Y_MM_S = 40.0f;    //const float HOMING_SPEED_Y_MM_S = 40.0f;
-const float HOMING_BACKOFF_Y_MM = 0.0f;     //onst float HOMING_BACKOFF_Y_MM = 5.0f;
-const float HOMING_SLOW_Y_MM_S  = 10.0f;    //const float HOMING_SLOW_Y_MM_S  = 10.0f;
+const float HOMING_SPEED_Y_MM_S = 40.0f; // const float HOMING_SPEED_Y_MM_S = 40.0f;
+const float HOMING_BACKOFF_Y_MM = 0.0f;  // onst float HOMING_BACKOFF_Y_MM = 5.0f;
+const float HOMING_SLOW_Y_MM_S = 10.0f;  // const float HOMING_SLOW_Y_MM_S  = 10.0f;
 
 const float HOMING_SPEED_C_MM_S = 20.0f;
 const float HOMING_BACKOFF_C_MM = 0.0f;
-const float HOMING_SLOW_C_MM_S  = 5.0f;
+const float HOMING_SLOW_C_MM_S = 5.0f;
 
 // ---------------- Grid ----------------
 
@@ -334,21 +325,19 @@ int MAX_ROWS = 12;
 int MAX_COLS = 7;
 
 // Spacing between grid positions
-float PITCH_X_MM   = 402.0f;   // Horizontal spacing
-float PITCH_Y_MM   = 38.0f;    // Vertical spacing
+float PITCH_X_MM = 402.0f; // Horizontal spacing
+float PITCH_Y_MM = 38.0f;  // Vertical spacing
 
 // Offset from home position to first grid cell
-float X0_OFFSET_MM = 185.0f;   //float X0_OFFSET_MM = 20.0f;
-float Y0_OFFSET_MM = 5.0f;   //float Y0_OFFSET_MM = 20.0f;
+float X0_OFFSET_MM = 185.0f; // float X0_OFFSET_MM = 20.0f;
+float Y0_OFFSET_MM = 5.0f;   // float Y0_OFFSET_MM = 20.0f;
 
 // Camera preset positions
-float C_IN_MM      = 10.0f;    // Camera extended position in cm and not in mm   //float C_IN_MM      = 80.0f;    // Camera extended position
-float C_OUT_MM     = 0.0f;     // Camera fully retracted
+float C_IN_MM = 10.0f; // Camera extended position in cm and not in mm   //float C_IN_MM      = 80.0f;    // Camera extended position
+float C_OUT_MM = 0.0f; // Camera fully retracted
 
-
-
-
-void saveSettings() {
+void saveSettings()
+{
 
   Settings s;
 
@@ -371,12 +360,14 @@ void saveSettings() {
   Serial.println("Settings saved (M500)");
 }
 
-void loadSettings() {
+void loadSettings()
+{
 
   Settings s;
   EEPROM.get(EEPROM_ADDR, s);
 
-  if (s.magic != EEPROM_MAGIC) {
+  if (s.magic != EEPROM_MAGIC)
+  {
     Serial.println("No valid EEPROM data (using defaults)");
     return;
   }
@@ -396,8 +387,8 @@ void loadSettings() {
   Serial.println("Settings loaded (M501)");
 }
 
-
-void resetSettings() {
+void resetSettings()
+{
 
   MAX_ROWS = 12;
   MAX_COLS = 7;
@@ -414,9 +405,49 @@ void resetSettings() {
   Serial.println("Settings reset to defaults (M502)");
 }
 
+float getMaxX()
+{
+  return X0_OFFSET_MM +
+         ((MAX_COLS - 1) * PITCH_X_MM);
+}
 
+float getMaxY()
+{
+  return Y0_OFFSET_MM +
+         ((MAX_ROWS - 1) * PITCH_Y_MM);
+}
 
+float getMaxC()
+{
+  return max(C_IN_MM, C_OUT_MM);
+}
 
+// Validate target limit before performing any move
+bool validateTarget(
+    int x,
+    int y,
+    int c)
+{
+  if (x < 0 || x > getMaxX())
+  {
+    Serial.println("ERROR: X limit exceeded");
+    return false;
+  }
+
+  if (y < 0 || y > getMaxY())
+  {
+    Serial.println("ERROR: Y limit exceeded");
+    return false;
+  }
+
+  if (c < 0 || c > getMaxC())
+  {
+    Serial.println("ERROR: C limit exceeded");
+    return false;
+  }
+
+  return true;
+}
 
 // ---------------- State & Objects ----------------
 
@@ -433,9 +464,9 @@ AccelStepper stepperY2(AccelStepper::DRIVER, Y2_STEP_PIN, Y2_DIR_PIN);
 AccelStepper stepperC(AccelStepper::DRIVER, C_STEP_PIN, C_DIR_PIN);
 
 // Homing status flags
-bool yHomed = false;   // TRUE if Y axis has been homed
-bool xHomed = false;   // TRUE if X axis has been homed
-bool cHomed = false;   // TRUE if camera axis has been homed
+bool yHomed = false; // TRUE if Y axis has been homed
+bool xHomed = false; // TRUE if X axis has been homed
+bool cHomed = false; // TRUE if camera axis has been homed
 
 // Flag set by interrupt-style button logic
 volatile bool homeBtnPressedFlag = false;
@@ -444,87 +475,136 @@ volatile bool homeBtnPressedFlag = false;
 bool machineBusy = false;
 
 // Motion mode: absolute (G90) or relative (G91)
-bool  absoluteMode = true;
+bool absoluteMode = true;
 
 // Feedrate in mm/min for G1 moves
 
-
-//float feedrate_mm_per_min = 6000;
+// float feedrate_mm_per_min = 6000;
 
 float feedrate_X_mm_per_min = 6000;
 float feedrate_Y_mm_per_min = 6000;
 float feedrate_C_mm_per_min = 6000;
 
-
-
 // Serial input line buffer
 String serialBuf;
 
+// Utilities: enable pins, LEDs, limits
 
-//Utilities: enable pins, LEDs, limits
+void clearSimulationLEDs()
+{
+  digitalWrite(SIM_X_POS_LED, LOW);
+  digitalWrite(SIM_X_NEG_LED, LOW);
+
+  digitalWrite(SIM_Y_POS_LED, LOW);
+  digitalWrite(SIM_Y_NEG_LED, LOW);
+
+  digitalWrite(SIM_C_POS_LED, LOW);
+  digitalWrite(SIM_C_NEG_LED, LOW);
+
+  digitalWrite(HOME_LED_PIN, LOW);
+  digitalWrite(ESTOP_LED_PIN, LOW);
+}
+
+void updateSimulationLEDs(float dx, float dy, float dc)
+{
+  if (!ENABLE_LED_SIMULATION)
+    return;
+
+  // Clear all motion LEDs and show E-STOP state
+  clearSimulationLEDs();
+
+  if (dx > 0)
+    digitalWrite(SIM_X_POS_LED, HIGH);
+  else if (dx < 0)
+    digitalWrite(SIM_X_NEG_LED, HIGH);
+
+  if (dy > 0)
+    digitalWrite(SIM_Y_POS_LED, HIGH);
+  else if (dy < 0)
+    digitalWrite(SIM_Y_NEG_LED, HIGH);
+
+  if (dc > 0)
+    digitalWrite(SIM_C_POS_LED, HIGH);
+  else if (dc < 0)
+    digitalWrite(SIM_C_NEG_LED, HIGH);
+}
+
 // Enable or disable a stepper driver
-void setEnablePin(int enPin, bool enable) {
-  if (enPin < 0) return;                // Skip if pin not defined
-  pinMode(enPin, OUTPUT);               // Configure pin as output
+void setEnablePin(int enPin, bool enable)
+{
+  if (enPin < 0)
+    return;               // Skip if pin not defined
+  pinMode(enPin, OUTPUT); // Configure pin as output
   int level =
-    ENABLE_ACTIVE_LOW
-      ? (enable ? LOW : HIGH)           // Active-low logic
-      : (enable ? HIGH : LOW);          // Active-high logic
-  digitalWrite(enPin, level);            // Apply enable state
+      ENABLE_ACTIVE_LOW
+          ? (enable ? LOW : HIGH)  // Active-low logic
+          : (enable ? HIGH : LOW); // Active-high logic
+  digitalWrite(enPin, level);      // Apply enable state
 }
 
 // Enable or disable all motor drivers
-void setAllEnabled(bool enable) {
-  setEnablePin(X_EN_PIN, enable);        // X motor
-  setEnablePin(Y1_EN_PIN, enable);       // Y motor 1
-  setEnablePin(Y2_EN_PIN, enable);       // Y motor 2
-  setEnablePin(C_EN_PIN, enable);        // Camera motor
+void setAllEnabled(bool enable)
+{
+  setEnablePin(X_EN_PIN, enable);  // X motor
+  setEnablePin(Y1_EN_PIN, enable); // Y motor 1
+  setEnablePin(Y2_EN_PIN, enable); // Y motor 2
+  setEnablePin(C_EN_PIN, enable);  // Camera motor
 }
 
 // Turn status LED on or off
-void setStatusLED(bool on) {
+void setStatusLED(bool on)
+{
   if (STATUS_LED_PIN >= 0)
     digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
 }
 
 // Update busy state and LED together
-void setMachineBusy(bool busy) {
-  machineBusy = busy;                   // Store busy flag
-  setStatusLED(busy);                   // Reflect on LED
+void setMachineBusy(bool busy)
+{
+  machineBusy = busy; // Store busy flag
+  setStatusLED(busy); // Reflect on LED
 }
 
 // Read and interpret a limit switch
-bool isLimitTriggered(int pin) {
-  if (pin < 0) return false;             // Ignore missing switches
-  int v = digitalRead(pin);              // Read pin state
+bool isLimitTriggered(int pin)
+{
+  if (pin < 0)
+    return false;           // Ignore missing switches
+  int v = digitalRead(pin); // Read pin state
   return LIMIT_ACTIVE_LOW
-           ? (v == LOW)                  // Active LOW logic
-           : (v == HIGH);                // Active HIGH logic
+             ? (v == LOW)   // Active LOW logic
+             : (v == HIGH); // Active HIGH logic
 }
 
-
-
-//Stepper configuration, status, and E-stop
-// Configure all GPIOs and stepper motion parameters
-void configureSteppers() {
+// Stepper configuration, status, and E-stop
+//  Configure all GPIOs and stepper motion parameters
+void configureSteppers()
+{
 
   // Configure Y-axis top limit switches as inputs with pullups
-  if (Y1_TOP_PIN >= 0) pinMode(Y1_TOP_PIN, INPUT_PULLUP);
-  if (Y2_TOP_PIN >= 0) pinMode(Y2_TOP_PIN, INPUT_PULLUP);
+  if (Y1_TOP_PIN >= 0)
+    pinMode(Y1_TOP_PIN, INPUT_PULLUP);
+  if (Y2_TOP_PIN >= 0)
+    pinMode(Y2_TOP_PIN, INPUT_PULLUP);
 
   // Configure X-axis limit switches
-  if (X_MIN_PIN >= 0)  pinMode(X_MIN_PIN, INPUT_PULLUP);
-  if (X_MAX_PIN >= 0)  pinMode(X_MAX_PIN, INPUT_PULLUP);
+  if (X_MIN_PIN >= 0)
+    pinMode(X_MIN_PIN, INPUT_PULLUP);
+  if (X_MAX_PIN >= 0)
+    pinMode(X_MAX_PIN, INPUT_PULLUP);
 
   // Configure camera axis limit switches
-  if (C_MIN_PIN >= 0)  pinMode(C_MIN_PIN, INPUT_PULLUP);
-  if (C_MAX_PIN >= 0)  pinMode(C_MAX_PIN, INPUT_PULLUP);
+  if (C_MIN_PIN >= 0)
+    pinMode(C_MIN_PIN, INPUT_PULLUP);
+  if (C_MAX_PIN >= 0)
+    pinMode(C_MAX_PIN, INPUT_PULLUP);
 
   // Configure manual home button input
   pinMode(HOME_BTN_PIN, INPUT_PULLUP);
 
   // Configure status LED output and ensure it's off
-  if (STATUS_LED_PIN >= 0) {
+  if (STATUS_LED_PIN >= 0)
+  {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
   }
@@ -535,7 +615,7 @@ void configureSteppers() {
 
   // Set Y-axis motors max speed
   stepperY1.setMaxSpeed(MAX_SPEED_Y_MM_S * stepsPerMM_Y);
-  stepperY2.setMaxSpeed(MAX_SPEED_Y_MM_S * stepsPerMM_Y);     //stepperY1;
+  stepperY2.setMaxSpeed(MAX_SPEED_Y_MM_S * stepsPerMM_Y); // stepperY1;
 
   // Set Y-axis motors acceleration
   stepperY1.setAcceleration(ACCEL_Y_MM_S2 * stepsPerMM_Y);
@@ -549,22 +629,25 @@ void configureSteppers() {
   setAllEnabled(true);
 }
 
+bool checkEmergencyStop()
+{
 
-
-
-
-
-
-
-
-
-bool checkEmergencyStop() {
-
-  while (Serial.available()) {
+  while (Serial.available())
+  {
 
     char c = Serial.read();
 
-    if (c == '!') {
+    if (c == '!')
+    {
+      if (ENABLE_LED_SIMULATION)
+      {
+        // Clear all motion LEDs and show E-STOP state
+        clearSimulationLEDs();
+
+        //  On E-STOP, On the E-STOP LED for visibility
+        digitalWrite(ESTOP_LED_PIN, !digitalRead(ESTOP_LED_PIN));
+        Serial.println("SIM E-STOP ACTIVE");
+      }
 
       Serial.println("EMERGENCY STOP!");
 
@@ -583,27 +666,17 @@ bool checkEmergencyStop() {
   return false;
 }
 
-
-
-
-
-
-
-
-
-
-
-//Position reporting and emergency stop
-// Report current machine position in millimeters
-void reportPosition() {
+// Position reporting and emergency stop
+//  Report current machine position in millimeters
+void reportPosition()
+{
 
   // Convert X steps to millimeters
   float x_mm = stepperX.currentPosition() / stepsPerMM_X;
 
   // Average both Y motors and convert to millimeters
   float y_mm =
-    ((stepperY1.currentPosition() + stepperY2.currentPosition()) * 0.5f)
-    / stepsPerMM_Y;
+      ((stepperY1.currentPosition() + stepperY2.currentPosition()) * 0.5f) / stepsPerMM_Y;
 
   // Convert camera axis steps to millimeters
   float c_mm = stepperC.currentPosition() / stepsPerMM_C;
@@ -632,7 +705,8 @@ void reportPosition() {
 }
 
 // Immediate emergency stop
-void eStop() {
+void eStop()
+{
 
   // Stop all motion immediately (decelerated)
   stepperX.stop();
@@ -650,22 +724,22 @@ void eStop() {
   Serial.println("!! EMERGENCY STOP TRIGGERED");
 }
 
-
-
-//Generic homing helper (single axis)
-// Home a single axis toward a minimum limit switch
+// Generic homing helper (single axis)
+//  Home a single axis toward a minimum limit switch
 void homeAxisToMin(
-  AccelStepper &st,            // Stepper object to home
-  int limitPin,                // Limit switch pin
-  int dirSign,                 // Direction sign (+1 or -1)
-  float stepsPerMM,            // Axis resolution
-  float fast_mm_s,             // Fast homing speed
-  float backoff_mm,            // Backoff distance
-  float slow_mm_s              // Slow re-approach speed
-) {
+    AccelStepper &st, // Stepper object to home
+    int limitPin,     // Limit switch pin
+    int dirSign,      // Direction sign (+1 or -1)
+    float stepsPerMM, // Axis resolution
+    float fast_mm_s,  // Fast homing speed
+    float backoff_mm, // Backoff distance
+    float slow_mm_s   // Slow re-approach speed
+)
+{
 
   // Abort if limit switch is missing
-  if (limitPin < 0) {
+  if (limitPin < 0)
+  {
     Serial.println("Home error: missing limit pin");
     return;
   }
@@ -716,18 +790,18 @@ void homeAxisToMin(
   st.setCurrentPosition(0);
 }
 
-
-//Dual-motor Y-axis homing helper
-// Home one Y motor independently to its top switch
+// Dual-motor Y-axis homing helper
+//  Home one Y motor independently to its top switch
 void homeOneY(
-  AccelStepper &st,            // Y motor stepper instance
-  int topPin,                  // Top limit switch pin
-  int dirSign,                 // Direction toward switch
-  float stepsPerMM,            // Axis resolution
-  float fast_mm_s,             // Fast homing speed
-  float backoff_mm,            // Backoff distance
-  float slow_mm_s              // Slow re-approach speed
-) {
+    AccelStepper &st, // Y motor stepper instance
+    int topPin,       // Top limit switch pin
+    int dirSign,      // Direction toward switch
+    float stepsPerMM, // Axis resolution
+    float fast_mm_s,  // Fast homing speed
+    float backoff_mm, // Backoff distance
+    float slow_mm_s   // Slow re-approach speed
+)
+{
 
   // Set fast homing speed
   st.setMaxSpeed(fabsf(fast_mm_s * stepsPerMM));
@@ -774,8 +848,8 @@ void homeOneY(
   st.setCurrentPosition(0);
 }
 
-
-void homeY_Dual() {
+void homeY_Dual()
+{
 
   Serial.println("Homing Y (dual synchronized)...");
 
@@ -800,78 +874,55 @@ void homeY_Dual() {
   bool y1Done = false;
   bool y2Done = false;
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
   // --- MOVE BOTH UNTIL EACH HITS SWITCH ---
- 
- 
 
+  while (!y1Done || !y2Done)
+  {
+    if (checkEmergencyStop())
+      return;
 
-
-
-
-
-
-
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-  while (!y1Done || !y2Done) {
-if (checkEmergencyStop()) return;
-
-    if (!y1Done) {
-      if (isLimitTriggered(Y1_TOP_PIN)) {
+    if (!y1Done)
+    {
+      if (isLimitTriggered(Y1_TOP_PIN))
+      {
         stepperY1.stop();
         y1Done = true;
-        
-      } else {
-        //stepperY1.run();
-        if (!y1Done) {
-  stepperY1.run();
-}
-        
+      }
+      else
+      {
+        // stepperY1.run();
+        if (!y1Done)
+        {
+          stepperY1.run();
+        }
       }
     }
 
-
-    if (!y2Done) {
-      if (isLimitTriggered(Y2_TOP_PIN)) {
+    if (!y2Done)
+    {
+      if (isLimitTriggered(Y2_TOP_PIN))
+      {
         stepperY2.stop();
         y2Done = true;
-        
-      } else {
-        //stepperY2.run();
-        if (!y2Done) {
-        stepperY2.run();
+      }
+      else
+      {
+        // stepperY2.run();
+        if (!y2Done)
+        {
+          stepperY2.run();
         }
-        
       }
     }
   }
 
-
-
   // Ensure both fully stopped
-  
-  while (stepperY1.isRunning() || stepperY2.isRunning()) {
 
-    if (checkEmergencyStop()) return;
+  while (stepperY1.isRunning() || stepperY2.isRunning())
+  {
+
+    if (checkEmergencyStop())
+      return;
 
     stepperY1.run();
     stepperY2.run();
@@ -883,12 +934,11 @@ if (checkEmergencyStop()) return;
   stepperY1.moveTo(stepperY1.currentPosition() - dir * backSteps);
   stepperY2.moveTo(stepperY2.currentPosition() - dir * backSteps);
 
+  while (stepperY1.distanceToGo() != 0 || stepperY2.distanceToGo() != 0)
+  {
 
-
-
-  while (stepperY1.distanceToGo() != 0 || stepperY2.distanceToGo() != 0) {
-
-if (checkEmergencyStop()) return;
+    if (checkEmergencyStop())
+      return;
 
     stepperY1.run();
     stepperY2.run();
@@ -907,61 +957,55 @@ if (checkEmergencyStop()) return;
   y1Done = false;
   y2Done = false;
 
+  while (!y1Done || !y2Done)
+  {
 
+    if (checkEmergencyStop())
+      return;
 
-
-
-
-
-
-
-  while (!y1Done || !y2Done) {
-
-if (checkEmergencyStop()) return;
-
-    if (!y1Done) {
-      if (isLimitTriggered(Y1_TOP_PIN)) {
+    if (!y1Done)
+    {
+      if (isLimitTriggered(Y1_TOP_PIN))
+      {
         stepperY1.stop();
         y1Done = true;
-        
-      } else {
-        //stepperY1.run();
-        if (!y1Done) {
-        stepperY1.run();
+      }
+      else
+      {
+        // stepperY1.run();
+        if (!y1Done)
+        {
+          stepperY1.run();
         }
-        
       }
     }
 
-
-
-    if (!y2Done) {
-      if (isLimitTriggered(Y2_TOP_PIN)) {
+    if (!y2Done)
+    {
+      if (isLimitTriggered(Y2_TOP_PIN))
+      {
         stepperY2.stop();
         y2Done = true;
-        
-      } else {
-        //stepperY2.run();
-        if (!y2Done) {
-        stepperY2.run();
+      }
+      else
+      {
+        // stepperY2.run();
+        if (!y2Done)
+        {
+          stepperY2.run();
         }
-        
       }
     }
   }
 
+  while (stepperY1.isRunning() || stepperY2.isRunning())
+  {
 
+    if (checkEmergencyStop())
+      return;
 
-
-
-
-  while (stepperY1.isRunning() || stepperY2.isRunning()) {
-
-    if (checkEmergencyStop()) return;
-    
     stepperY1.run();
     stepperY2.run();
-    
   }
 
   // --- ZERO BOTH ---
@@ -975,13 +1019,14 @@ if (checkEmergencyStop()) return;
   setMachineBusy(false);
 }
 
-
-//X-axis homing wrapper
-// Home X axis toward minimum switch
-void homeX() {
+// X-axis homing wrapper
+//  Home X axis toward minimum switch
+void homeX()
+{
 
   // Skip if no switch installed
-  if (X_MIN_PIN < 0) {
+  if (X_MIN_PIN < 0)
+  {
     Serial.println("X home skipped: no switch");
     return;
   }
@@ -998,13 +1043,13 @@ void homeX() {
 
   // Perform homing sequence
   homeAxisToMin(
-    stepperX,                  // X stepper
-    X_MIN_PIN,                 // Limit switch
-    dir,                       // Direction
-    stepsPerMM_X,              // Resolution
-    HOMING_SPEED_X_MM_S,       // Fast speed
-    HOMING_BACKOFF_X_MM,       // Backoff distance
-    HOMING_SLOW_X_MM_S         // Slow approach speed
+      stepperX,            // X stepper
+      X_MIN_PIN,           // Limit switch
+      dir,                 // Direction
+      stepsPerMM_X,        // Resolution
+      HOMING_SPEED_X_MM_S, // Fast speed
+      HOMING_BACKOFF_X_MM, // Backoff distance
+      HOMING_SLOW_X_MM_S   // Slow approach speed
   );
 
   // Mark X as homed
@@ -1017,13 +1062,14 @@ void homeX() {
   setMachineBusy(false);
 }
 
-
-//Camera (C axis) homing wrapper
-// Home camera axis by retracting
-void homeC() {
+// Camera (C axis) homing wrapper
+//  Home camera axis by retracting
+void homeC()
+{
 
   // Skip if no switch installed
-  if (C_MIN_PIN < 0) {
+  if (C_MIN_PIN < 0)
+  {
     Serial.println("C home skipped: no switch");
     return;
   }
@@ -1040,13 +1086,13 @@ void homeC() {
 
   // Perform homing motion
   homeAxisToMin(
-    stepperC,                  // Camera stepper
-    C_MIN_PIN,                 // Retract switch
-    dir,                       // Direction
-    stepsPerMM_C,              // Resolution
-    HOMING_SPEED_C_MM_S,       // Fast speed
-    HOMING_BACKOFF_C_MM,       // Backoff distance
-    HOMING_SLOW_C_MM_S         // Slow approach speed
+      stepperC,            // Camera stepper
+      C_MIN_PIN,           // Retract switch
+      dir,                 // Direction
+      stepsPerMM_C,        // Resolution
+      HOMING_SPEED_C_MM_S, // Fast speed
+      HOMING_BACKOFF_C_MM, // Backoff distance
+      HOMING_SLOW_C_MM_S   // Slow approach speed
   );
 
   // Mark camera as homed
@@ -1059,10 +1105,10 @@ void homeC() {
   setMachineBusy(false);
 }
 
-
-//Full homing sequence (safe order)
-// Perform full homing in safe mechanical order
-void homeSequence_Full() {
+// Full homing sequence (safe order)
+//  Perform full homing in safe mechanical order
+void homeSequence_Full()
+{
 
   // Home camera first to retract out of the way
   if (C_MIN_PIN >= 0)
@@ -1076,20 +1122,21 @@ void homeSequence_Full() {
     homeX();
 }
 
-
-//Coordinated motion scaling helper
-// Scale max speed per axis so multi-axis moves finish together
+// Coordinated motion scaling helper
+//  Scale max speed per axis so multi-axis moves finish together
 void setScaledMax(
-  AccelStepper &st,            // Stepper to configure
-  float stepsPerMM,            // Axis resolution
-  long dSteps,                 // Delta steps for this axis
-  long maxdSteps,              // Largest delta among all axes
-  float feed_mm_s,             // Requested feedrate
-  float axisMaxMmS             // Axis maximum speed
-) {
+    AccelStepper &st, // Stepper to configure
+    float stepsPerMM, // Axis resolution
+    long dSteps,      // Delta steps for this axis
+    long maxdSteps,   // Largest delta among all axes
+    float feed_mm_s,  // Requested feedrate
+    float axisMaxMmS  // Axis maximum speed
+)
+{
 
   // If no motion, use axis max speed
-  if (maxdSteps == 0) {
+  if (maxdSteps == 0)
+  {
     st.setMaxSpeed(axisMaxMmS * stepsPerMM);
     return;
   }
@@ -1099,7 +1146,7 @@ void setScaledMax(
 
   // Scale feedrate while respecting axis max
   float mm_s =
-    (feed_mm_s < axisMaxMmS ? feed_mm_s : axisMaxMmS) * share;
+      (feed_mm_s < axisMaxMmS ? feed_mm_s : axisMaxMmS) * share;
 
   // Prevent zero-speed axis starvation
   if (mm_s < 1.0f)
@@ -1109,28 +1156,32 @@ void setScaledMax(
   st.setMaxSpeed(mm_s * stepsPerMM);
 }
 
-
-//Coordinated linear motion (G0 / G1 engine)
-// Perform a coordinated linear move in X, Y, and/or C
+// Coordinated linear motion (G0 / G1 engine)
+//  Perform a coordinated linear move in X, Y, and/or C
 void moveLinear(
-  float x_mm, bool hasX,        // Target X position and presence flag
-  float y_mm, bool hasY,        // Target Y position and presence flag
-  float c_mm, bool hasC,        // Target C position and presence flag
-  bool rapid                    // TRUE for G0 (rapid), FALSE for G1
-) {
+    float x_mm, bool hasX, // Target X position and presence flag
+    float y_mm, bool hasY, // Target Y position and presence flag
+    float c_mm, bool hasC, // Target C position and presence flag
+    bool rapid             // TRUE for G0 (rapid), FALSE for G1
+)
+{
+
+  if (!validateTarget(x_mm, y_mm, c_mm))
+    return;
 
   // Current target positions in steps
-  long tx  = stepperX.currentPosition();
+  long tx = stepperX.currentPosition();
   long ty1 = stepperY1.currentPosition();
   long ty2 = stepperY2.currentPosition();
-  long tc  = stepperC.currentPosition();
+  long tc = stepperC.currentPosition();
 
   // Convert requested X position to steps if present
   if (hasX)
     tx = (long)lroundf(x_mm * stepsPerMM_X);
 
   // Convert requested Y position to steps (both motors)
-  if (hasY) {
+  if (hasY)
+  {
     long ty = (long)lroundf(y_mm * stepsPerMM_Y);
     ty1 = ty;
     ty2 = ty;
@@ -1145,11 +1196,44 @@ void moveLinear(
 
   // Average Y motor positions for delta calculation
   long dy =
-    ((ty1 + ty2) / 2) -
-    ((stepperY1.currentPosition() + stepperY2.currentPosition()) / 2);
+      ((ty1 + ty2) / 2) -
+      ((stepperY1.currentPosition() + stepperY2.currentPosition()) / 2);
 
   // Camera delta
   long dc = tc - stepperC.currentPosition();
+
+  if (ENABLE_LED_SIMULATION)
+  {
+    // Clear all motion LEDs and show E-STOP state
+    clearSimulationLEDs();
+
+    if (dx > 0)
+      digitalWrite(SIM_X_POS_LED, HIGH);
+
+    if (dx < 0)
+      digitalWrite(SIM_X_NEG_LED, HIGH);
+
+    if (dy > 0)
+      digitalWrite(SIM_Y_POS_LED, HIGH);
+
+    if (dy < 0)
+      digitalWrite(SIM_Y_NEG_LED, HIGH);
+
+    if (dc != 0)
+    {
+      digitalWrite(SIM_C_POS_LED, HIGH);
+      digitalWrite(SIM_Y_POS_LED, HIGH);
+    }
+
+    Serial.print("SIM DX=");
+    Serial.print(dx);
+
+    Serial.print(" DY=");
+    Serial.print(dy);
+
+    Serial.print(" DC=");
+    Serial.println(dc);
+  }
 
   // Determine the largest delta (for speed scaling)
   long maxd = 0;
@@ -1162,18 +1246,15 @@ void moveLinear(
     return;
 
   // Determine feedrate in mm/s
+  float feedX = rapid ? MAX_SPEED_X_MM_S : (feedrate_X_mm_per_min / 60.0f);
+  float feedY = rapid ? MAX_SPEED_Y_MM_S : (feedrate_Y_mm_per_min / 60.0f);
+  float feedC = rapid ? MAX_SPEED_C_MM_S : (feedrate_C_mm_per_min / 60.0f);
 
-
-float feedX = rapid ? MAX_SPEED_X_MM_S : (feedrate_X_mm_per_min / 60.0f);
-float feedY = rapid ? MAX_SPEED_Y_MM_S : (feedrate_Y_mm_per_min / 60.0f);
-float feedC = rapid ? MAX_SPEED_C_MM_S : (feedrate_C_mm_per_min / 60.0f);
-
-
-setScaledMax(stepperX,  stepsPerMM_X, dx, maxd, feedX, MAX_SPEED_X_MM_S);
-setScaledMax(stepperY1, stepsPerMM_Y, dy, maxd, feedY, MAX_SPEED_Y_MM_S);
-setScaledMax(stepperY2, stepsPerMM_Y, dy, maxd, feedY, MAX_SPEED_Y_MM_S);
-setScaledMax(stepperC,  stepsPerMM_C, dc, maxd, feedC, MAX_SPEED_C_MM_S);
-
+  setScaledMax(stepperX, stepsPerMM_X, dx, maxd, feedX, MAX_SPEED_X_MM_S);
+  setScaledMax(stepperY1, stepsPerMM_Y, dy, maxd, feedY, MAX_SPEED_Y_MM_S);
+  setScaledMax(stepperY2, stepsPerMM_Y, dy, maxd, feedY, MAX_SPEED_Y_MM_S);
+  setScaledMax(stepperC, stepsPerMM_C, dc, maxd, feedC, MAX_SPEED_C_MM_S);
+  updateSimulationLEDs(dx, dy, dc);
 
   // Set final target positions
   stepperX.moveTo(tx);
@@ -1186,18 +1267,26 @@ setScaledMax(stepperC,  stepsPerMM_C, dc, maxd, feedC, MAX_SPEED_C_MM_S);
   setMachineBusy(true);
 
   // Run all steppers until motion completes
-  
+
   while (stepperX.distanceToGo() != 0 ||
          stepperY1.distanceToGo() != 0 ||
          stepperY2.distanceToGo() != 0 ||
-         stepperC.distanceToGo() != 0) {
+         stepperC.distanceToGo() != 0)
+  {
 
-if (checkEmergencyStop()) return;
+    if (checkEmergencyStop())
+      return;
 
-    stepperX.run();             // Advance X motor
-    stepperY1.run();            // Advance Y motor 1
-    stepperY2.run();            // Advance Y motor 2
-    stepperC.run();             // Advance camera motor
+    stepperX.run();  // Advance X motor
+    stepperY1.run(); // Advance Y motor 1
+    stepperY2.run(); // Advance Y motor 2
+    stepperC.run();  // Advance camera motor
+  }
+
+  if (ENABLE_LED_SIMULATION)
+  {
+    // Clear all motion LEDs and show E-STOP state
+    clearSimulationLEDs();
   }
 
   // Clear busy flag
@@ -1207,17 +1296,18 @@ if (checkEmergencyStop()) return;
   reportPosition();
 }
 
-//Home button debounce & trigger
-// Button debounce time in milliseconds
+// Home button debounce & trigger
+//  Button debounce time in milliseconds
 const unsigned long HOME_DEBOUNCE_MS = 50;
 
 // Poll and debounce the physical HOME button
-void serviceHomeButton() {
+void serviceHomeButton()
+{
 
-  static unsigned long lastChange = 0;   // Last state change time
-  static bool lastHigh = true;           // Previous stable state
-  static bool pressed = false;           // Button currently pressed
-  static unsigned long pressStart = 0;   // Time press began
+  static unsigned long lastChange = 0; // Last state change time
+  static bool lastHigh = true;         // Previous stable state
+  static bool pressed = false;         // Button currently pressed
+  static unsigned long pressStart = 0; // Time press began
 
   // Read button state (HIGH = idle, LOW = pressed)
   bool stateHigh = digitalRead(HOME_BTN_PIN);
@@ -1226,63 +1316,75 @@ void serviceHomeButton() {
   unsigned long now = millis();
 
   // Track any state change
-  if (stateHigh != lastHigh) {
+  if (stateHigh != lastHigh)
+  {
     lastChange = now;
     lastHigh = stateHigh;
   }
 
   // Check if state has been stable long enough
-  if ((now - lastChange) >= HOME_DEBOUNCE_MS) {
+  if ((now - lastChange) >= HOME_DEBOUNCE_MS)
+  {
 
     // Button just pressed
-    if (!stateHigh && !pressed) {
+    if (!stateHigh && !pressed)
+    {
       pressed = true;
       pressStart = now;
     }
 
     // Button just released
-    else if (stateHigh && pressed) {
+    else if (stateHigh && pressed)
+    {
       unsigned long dur = now - pressStart;
       pressed = false;
 
       // Valid press detected
-      if (dur >= HOME_DEBOUNCE_MS) {
-        homeBtnPressedFlag = true;       // Queue full homing sequence
+      if (dur >= HOME_DEBOUNCE_MS)
+      {
+        homeBtnPressedFlag = true; // Queue full homing sequence
       }
     }
   }
 }
 
-
-//Serial parsing utilities
-// Read one complete line from serial input
-bool readLine(String &out) {
+// Serial parsing utilities
+//  Read one complete line from serial input
+bool readLine(String &out)
+{
 
   // Process incoming serial characters
-  while (Serial.available()) {
+  while (Serial.available())
+  {
 
-    char c = Serial.read();               // Read one character
+    char c = Serial.read(); // Read one character
 
     // End-of-line detected
-    if (c == '\n' || c == '\r') {
-      if (serialBuf.length() > 0) {
-        out = serialBuf;                  // Return buffered line
-        serialBuf = "";                   // Clear buffer
+    if (c == '\n' || c == '\r')
+    {
+      if (serialBuf.length() > 0)
+      {
+        out = serialBuf; // Return buffered line
+        serialBuf = "";  // Clear buffer
         return true;
       }
     }
 
     // Normal character
-    else {
+    else
+    {
 
       // Semicolon starts comment until end of line
-      if (c == ';') {
-        while (Serial.available()) {
+      if (c == ';')
+      {
+        while (Serial.available())
+        {
           char d = Serial.read();
           if (d == '\n' || d == '\r')
             break;
         }
-        if (serialBuf.length() > 0) {
+        if (serialBuf.length() > 0)
+        {
           out = serialBuf;
           serialBuf = "";
           return true;
@@ -1291,8 +1393,10 @@ bool readLine(String &out) {
       }
 
       // Parentheses comment (G-code style)
-      else if (c == '(') {
-        while (Serial.available()) {
+      else if (c == '(')
+      {
+        while (Serial.available())
+        {
           char d = Serial.read();
           if (d == ')')
             break;
@@ -1300,7 +1404,8 @@ bool readLine(String &out) {
       }
 
       // Normal character, add to buffer
-      else {
+      else
+      {
         serialBuf += c;
       }
     }
@@ -1310,29 +1415,31 @@ bool readLine(String &out) {
   return false;
 }
 
-
-//String cleanup and parsing helpers
-// Trim whitespace, uppercase, and normalize spacing
-String uptrim(const String &s) {
-  String t = s;           // Copy string
-  t.trim();               // Remove leading/trailing whitespace
-  t.toUpperCase();        // Convert to uppercase
-  t.replace("  ", " ");   // Collapse double spaces
+// String cleanup and parsing helpers
+//  Trim whitespace, uppercase, and normalize spacing
+String uptrim(const String &s)
+{
+  String t = s;         // Copy string
+  t.trim();             // Remove leading/trailing whitespace
+  t.toUpperCase();      // Convert to uppercase
+  t.replace("  ", " "); // Collapse double spaces
   return t;
 }
 
 // Parse a floating-point word like X10.5 or F1200
-bool parseWord(const String &line, char word, float &outVal) {
+bool parseWord(const String &line, char word, float &outVal)
+{
 
   // Locate the word character
   int idx = line.indexOf(word);
   if (idx < 0)
     return false;
 
-  String num = "";        // Accumulate numeric characters
+  String num = ""; // Accumulate numeric characters
 
   // Parse characters following the word
-  for (int i = idx + 1; i < (int)line.length(); ++i) {
+  for (int i = idx + 1; i < (int)line.length(); ++i)
+  {
     char c = line[i];
 
     if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.')
@@ -1351,73 +1458,90 @@ bool parseWord(const String &line, char word, float &outVal) {
 }
 
 // Check if a command references an axis character
-bool hasAxisChar(const String &line, char axis) {
+bool hasAxisChar(const String &line, char axis)
+{
   return line.indexOf(axis) >= 0;
 }
 
 // Parse a word like "FX200" or "FY150" from a line
-bool parseWordStr(const String &line, const String &word, float &outVal) {
+bool parseWordStr(const String &line, const String &word, float &outVal)
+{
   int index = line.indexOf(word);
-  if (index == -1) return false;
-  
+  if (index == -1)
+    return false;
+
   int start = index + word.length();
   String valStr = "";
-  
-  while (start < line.length() && (isDigit(line[start]) || line[start] == '.' || line[start] == '-')) {
+
+  while (start < line.length() && (isDigit(line[start]) || line[start] == '.' || line[start] == '-'))
+  {
     valStr += line[start];
     start++;
   }
-  
-  if (valStr.length() == 0) return false;
-  
+
+  if (valStr.length() == 0)
+    return false;
+
   outVal = valStr.toFloat();
   return true;
 }
 
-
-
 // ---------- Motion Arrival Notification ----------
-bool lastMotionState = false;  // remembers previous motion state
+bool lastMotionState = false; // remembers previous motion state
 
-//Setup function
-// Arduino setup routine
-void setup() {
-
+// Setup function
+//  Arduino setup routine
+void setup()
+{
 
   // Initialize serial communication
   Serial.begin(115200);
-  //delay(1000);
+  // delay(1000);
 
   // Wait for USB serial on some boards
-  while (!Serial) {;}
+  while (!Serial)
+  {
+    ;
+  }
 
   // Compute steps-per-mm values
   calcStepsPerMM_All();
 
   // Configure steppers and I/O
   configureSteppers();
-  
-  loadSettings();
 
+  if (ENABLE_LED_SIMULATION)
+  {
+    pinMode(SIM_X_POS_LED, OUTPUT);
+    pinMode(SIM_X_NEG_LED, OUTPUT);
+
+    pinMode(SIM_Y_POS_LED, OUTPUT);
+    pinMode(SIM_Y_NEG_LED, OUTPUT);
+
+    pinMode(SIM_C_POS_LED, OUTPUT);
+    pinMode(SIM_C_NEG_LED, OUTPUT);
+
+    pinMode(HOME_LED_PIN, OUTPUT);
+    pinMode(ESTOP_LED_PIN, OUTPUT);
+
+    // Clear all motion LEDs and show E-STOP state
+    clearSimulationLEDs();
+  }
+  loadSettings();
 
   // Startup banner
   Serial.println("Rack Monitor G-code Ready");
   Serial.println(
-    "Supported: G0/G1 X Y C F | "
-    "G90/G91 | G28 [X][Y][C] | "
-    "M114 | M17/M18 | "
-    "M700 R C | M710/M711 | ! E-stop"
-  );
+      "Supported: G0/G1 X Y C F | "
+      "G90/G91 | G28 [X][Y][C] | "
+      "M114 | M17/M18 | "
+      "M700 R C | M710/M711 | ! E-stop");
 }
 
-
-
-
-
-
-//Main loop and command processing
-// Arduino main loop
-void loop() {
+// Main loop and command processing
+//  Arduino main loop
+void loop()
+{
 
   // Poll home button
   serviceHomeButton();
@@ -1427,7 +1551,8 @@ void loop() {
       stepperX.distanceToGo() == 0 &&
       stepperY1.distanceToGo() == 0 &&
       stepperY2.distanceToGo() == 0 &&
-      stepperC.distanceToGo() == 0) {
+      stepperC.distanceToGo() == 0)
+  {
 
     homeBtnPressedFlag = false;
     homeSequence_Full();
@@ -1438,8 +1563,7 @@ void loop() {
   // Read one command line from serial
   if (!readLine(line))
     return;
-    Serial.println("Yo! On my way!");
-
+  Serial.println("Yo! On my way!");
 
   // Normalize line
   line = uptrim(line);
@@ -1449,69 +1573,174 @@ void loop() {
     return;
 
   // Emergency stop command
-  if (line == "!") {
+  if (line == "!")
+  {
+    if (ENABLE_LED_SIMULATION)
+    {
+      // Clear all motion LEDs and show E-STOP state
+      clearSimulationLEDs();
+
+      //  On E-STOP, On the E-STOP LED for visibility
+      digitalWrite(ESTOP_LED_PIN, !digitalRead(ESTOP_LED_PIN));
+      Serial.println("SIM E-STOP ACTIVE");
+    }
+
     eStop();
     return;
   }
 
   // Motion mode commands
-  if (line.startsWith("G90")) {
+  if (line.startsWith("G90"))
+  {
     absoluteMode = true;
     Serial.println("ABS mode (G90)");
     return;
   }
 
-  if (line.startsWith("G91")) {
+  if (line.startsWith("G91"))
+  {
     absoluteMode = false;
     Serial.println("REL mode (G91)");
     return;
   }
 
   // Homing command
-  if (line.startsWith("G28")) {
+  if (line.startsWith("G28"))
+  {
+
+    if (ENABLE_LED_SIMULATION)
+    {
+      Serial.println("SIM HOMING START");
+
+      float x_mm =
+          stepperX.currentPosition() / stepsPerMM_X;
+
+      float y_mm =
+          ((stepperY1.currentPosition() +
+            stepperY2.currentPosition()) *
+           0.5f) /
+          stepsPerMM_Y;
+
+      float c_mm =
+          stepperC.currentPosition() / stepsPerMM_C;
+
+      Serial.print("Current Position X:");
+      Serial.print(x_mm, 3);
+
+      Serial.print(" Y:");
+      Serial.print(y_mm, 3);
+
+      Serial.print(" C:");
+      Serial.println(c_mm, 3);
+
+      float maxTravel =
+          max(fabs(x_mm),
+              max(fabs(y_mm),
+                  fabs(c_mm)));
+
+      unsigned long simTime =
+          (unsigned long)(maxTravel * 20.0f);
+
+      if (simTime < 1000)
+        simTime = 1000;
+
+      unsigned long startTime = millis();
+      bool ledState = false;
+      unsigned long lastBlink = 0;
+
+      // Clear all motion LEDs and show E-STOP state
+      clearSimulationLEDs();
+      
+      while ((millis() - startTime) < simTime)
+      {
+        if ((millis() - lastBlink) > 150)
+        {
+          ledState = !ledState;
+
+          if (fabs(x_mm) > 0.01f)
+            digitalWrite(SIM_X_POS_LED, ledState);
+
+          if (fabs(y_mm) > 0.01f)
+            digitalWrite(SIM_Y_POS_LED, ledState);
+
+          lastBlink = millis();
+        }
+      }
+
+      digitalWrite(SIM_X_POS_LED, LOW);
+      digitalWrite(SIM_Y_POS_LED, LOW);
+      digitalWrite(HOME_LED_PIN, HIGH);
+
+      // Simulate arrival at home position
+      stepperX.setCurrentPosition(0);
+
+      stepperY1.setCurrentPosition(0);
+      stepperY2.setCurrentPosition(0);
+
+      stepperC.setCurrentPosition(0);
+
+      xHomed = true;
+      yHomed = true;
+      cHomed = true;
+
+      Serial.println("SIM HOMING COMPLETE");
+
+      return;
+    }
 
     bool x = hasAxisChar(line, 'X');
     bool y = hasAxisChar(line, 'Y');
     bool c = hasAxisChar(line, 'C');
 
     // No axis specified = full homing
-    if (!x && !y && !c) {
+    if (!x && !y && !c)
+    {
       homeSequence_Full();
-    } else {
-      if (c) homeC();
-      if (y) homeY_Dual();
-      if (x) homeX();
+    }
+    else
+    {
+      if (c)
+        homeC();
+      if (y)
+        homeY_Dual();
+      if (x)
+        homeX();
     }
     return;
   }
 
   // Status and motor enable commands
-  if (line.startsWith("M114")) {
+  if (line.startsWith("M114"))
+  {
     reportPosition();
     return;
   }
 
-  if (line.startsWith("M17")) {
-    setAllEnabled(true);    //IS (true)
+  if (line.startsWith("M17"))
+  {
+    setAllEnabled(true); // IS (true)
     Serial.println("Motors ENABLED");
     return;
   }
 
-  if (line.startsWith("M18") || line.startsWith("M84")) {
-    setAllEnabled(false);      //IS (false)
+  if (line.startsWith("M18") || line.startsWith("M84"))
+  {
+    setAllEnabled(false); // IS (false)
     Serial.println("Motors DISABLED");
     return;
   }
 
   // Grid move command
-  if (line.startsWith("M700")) {
+  if (line.startsWith("M700"))
+  {
 
     float r = -1, c = -1;
 
     bool hasR = parseWord(line, 'R', r);
     bool hasCw = parseWord(line, 'C', c);
 
-    if (!(hasR && hasCw)) {
+    if (!(hasR && hasCw))
+    {
       Serial.println("Err: M700 needs R and C");
       return;
     }
@@ -1520,7 +1749,8 @@ void loop() {
     int col = (int)c;
 
     if (row < 0 || row >= MAX_ROWS ||
-        col < 0 || col >= MAX_COLS) {
+        col < 0 || col >= MAX_COLS)
+    {
       Serial.println("Err: M700 R/C out of range");
       return;
     }
@@ -1534,280 +1764,318 @@ void loop() {
     float xTarget = X0_OFFSET_MM + col * PITCH_X_MM;
     float yTarget = Y0_OFFSET_MM + row * PITCH_Y_MM;
 
-    moveLinear(xTarget, true, yTarget, true, 0, false, true);    //moveLinear(xTarget, true, yTarget, true, 0, false, false);
+    moveLinear(xTarget, true, yTarget, true, 0, false, true); // moveLinear(xTarget, true, yTarget, true, 0, false, false);
     return;
   }
 
   // Camera presets
-  if (line.startsWith("M710")) {
+  if (line.startsWith("M710"))
+  {
     moveLinear(0, false, 0, false, C_IN_MM, true, false);
     return;
   }
 
-  if (line.startsWith("M711")) {
+  if (line.startsWith("M711"))
+  {
     moveLinear(0, false, 0, false, C_OUT_MM, true, false);
     return;
   }
 
+  if (line.startsWith("M701"))
+  {
 
-if (line.startsWith("M701")) {
+    float r = -1, c = -1;
+    bool hasR = parseWord(line, 'R', r);
+    bool hasCw = parseWord(line, 'C', c);
 
-  float r = -1, c = -1;
-  bool hasR = parseWord(line, 'R', r);
-  bool hasCw = parseWord(line, 'C', c);
+    if (!(hasR && hasCw))
+    {
+      Serial.println("Err: M701 needs R and C");
+      return;
+    }
 
-  if (!(hasR && hasCw)) {
-    Serial.println("Err: M701 needs R and C");
+    int newRows = (int)r;
+    int newCols = (int)c;
+
+    // 🔒 SAFETY LIMITS (important)
+    if (newRows <= 0 || newRows > 100)
+    {
+      Serial.println("Err: Invalid ROWS (1–100)");
+      return;
+    }
+
+    if (newCols <= 0 || newCols > 100)
+    {
+      Serial.println("Err: Invalid COLS (1–100)");
+      return;
+    }
+
+    MAX_ROWS = newRows;
+    MAX_COLS = newCols;
+
+    Serial.print("Grid updated: ROWS=");
+    Serial.print(MAX_ROWS);
+    Serial.print(" COLS=");
+    Serial.println(MAX_COLS);
+
     return;
   }
 
-  int newRows = (int)r;
-  int newCols = (int)c;
+  if (line.startsWith("M702"))
+  {
 
-  // 🔒 SAFETY LIMITS (important)
-  if (newRows <= 0 || newRows > 100) {
-    Serial.println("Err: Invalid ROWS (1–100)");
+    float px = -1, py = -1;
+    bool hasPX = parseWord(line, 'X', px);
+    bool hasPY = parseWord(line, 'Y', py);
+
+    if (!(hasPX || hasPY))
+    {
+      Serial.println("Err: M702 needs X and/or Y");
+      return;
+    }
+
+    // 🔒 Safety limits (VERY important)
+    if (hasPX)
+    {
+      if (px <= 0 || px > 1000)
+      {
+        Serial.println("Err: Invalid X pitch (0–1000 mm)");
+        return;
+      }
+      PITCH_X_MM = px;
+    }
+
+    if (hasPY)
+    {
+      if (py <= 0 || py > 1000)
+      {
+        Serial.println("Err: Invalid Y pitch (0–1000 mm)");
+        return;
+      }
+      PITCH_Y_MM = py;
+    }
+
+    Serial.print("Pitch updated: X=");
+    Serial.print(PITCH_X_MM);
+    Serial.print(" Y=");
+    Serial.println(PITCH_Y_MM);
+
     return;
   }
 
-  if (newCols <= 0 || newCols > 100) {
-    Serial.println("Err: Invalid COLS (1–100)");
+  if (line.startsWith("M703"))
+  {
+
+    float ox = 0, oy = 0;
+    bool hasOX = parseWord(line, 'X', ox);
+    bool hasOY = parseWord(line, 'Y', oy);
+
+    if (!(hasOX || hasOY))
+    {
+      Serial.println("Err: M703 needs X and/or Y");
+      return;
+    }
+
+    // 🔒 Safety limits (adjust if needed)
+    if (hasOX)
+    {
+      if (ox < -1000 || ox > 1000)
+      {
+        Serial.println("Err: Invalid X offset (-1000 to 1000 mm)");
+        return;
+      }
+      X0_OFFSET_MM = ox;
+    }
+
+    if (hasOY)
+    {
+      if (oy < -1000 || oy > 1000)
+      {
+        Serial.println("Err: Invalid Y offset (-1000 to 1000 mm)");
+        return;
+      }
+      Y0_OFFSET_MM = oy;
+    }
+
+    Serial.print("Offsets updated: X0=");
+    Serial.print(X0_OFFSET_MM);
+    Serial.print(" Y0=");
+    Serial.println(Y0_OFFSET_MM);
+
     return;
   }
 
-  MAX_ROWS = newRows;
-  MAX_COLS = newCols;
+  if (line.startsWith("M704"))
+  {
 
-  Serial.print("Grid updated: ROWS=");
-  Serial.print(MAX_ROWS);
-  Serial.print(" COLS=");
-  Serial.println(MAX_COLS);
+    float inPos = 0, outPos = 0;
+    bool hasI = parseWord(line, 'I', inPos);
+    bool hasO = parseWord(line, 'O', outPos);
 
-  return;
-}
+    if (!(hasI || hasO))
+    {
+      Serial.println("Err: M704 needs I and/or O");
+      return;
+    }
 
+    // 🔒 Safety limits (adjust to your machine travel)
+    if (hasI)
+    {
+      if (inPos < 0 || inPos > 200)
+      {
+        Serial.println("Err: Invalid C_IN (0–200 mm)");
+        return;
+      }
+      C_IN_MM = inPos;
+    }
 
-if (line.startsWith("M702")) {
+    if (hasO)
+    {
+      if (outPos < 0 || outPos > 200)
+      {
+        Serial.println("Err: Invalid C_OUT (0–200 mm)");
+        return;
+      }
+      C_OUT_MM = outPos;
+    }
 
-  float px = -1, py = -1;
-  bool hasPX = parseWord(line, 'X', px);
-  bool hasPY = parseWord(line, 'Y', py);
+    Serial.print("Camera positions updated: IN=");
+    Serial.print(C_IN_MM);
+    Serial.print(" OUT=");
+    Serial.println(C_OUT_MM);
 
-  if (!(hasPX || hasPY)) {
-    Serial.println("Err: M702 needs X and/or Y");
     return;
   }
 
-  // 🔒 Safety limits (VERY important)
-  if (hasPX) {
-    if (px <= 0 || px > 1000) {
-      Serial.println("Err: Invalid X pitch (0–1000 mm)");
-      return;
-    }
-    PITCH_X_MM = px;
-  }
-
-  if (hasPY) {
-    if (py <= 0 || py > 1000) {
-      Serial.println("Err: Invalid Y pitch (0–1000 mm)");
-      return;
-    }
-    PITCH_Y_MM = py;
-  }
-
-  Serial.print("Pitch updated: X=");
-  Serial.print(PITCH_X_MM);
-  Serial.print(" Y=");
-  Serial.println(PITCH_Y_MM);
-
-  return;
-}
-
-
-if (line.startsWith("M703")) {
-
-  float ox = 0, oy = 0;
-  bool hasOX = parseWord(line, 'X', ox);
-  bool hasOY = parseWord(line, 'Y', oy);
-
-  if (!(hasOX || hasOY)) {
-    Serial.println("Err: M703 needs X and/or Y");
+  if (line.startsWith("M705"))
+  {
+    Serial.print("ROWS=");
+    Serial.print(MAX_ROWS);
+    Serial.print(" COLS=");
+    Serial.println(MAX_COLS);
     return;
   }
 
-  // 🔒 Safety limits (adjust if needed)
-  if (hasOX) {
-    if (ox < -1000 || ox > 1000) {
-      Serial.println("Err: Invalid X offset (-1000 to 1000 mm)");
-      return;
-    }
-    X0_OFFSET_MM = ox;
-  }
-
-  if (hasOY) {
-    if (oy < -1000 || oy > 1000) {
-      Serial.println("Err: Invalid Y offset (-1000 to 1000 mm)");
-      return;
-    }
-    Y0_OFFSET_MM = oy;
-  }
-
-  Serial.print("Offsets updated: X0=");
-  Serial.print(X0_OFFSET_MM);
-  Serial.print(" Y0=");
-  Serial.println(Y0_OFFSET_MM);
-
-  return;
-}
-
-
-if (line.startsWith("M704")) {
-
-  float inPos = 0, outPos = 0;
-  bool hasI = parseWord(line, 'I', inPos);
-  bool hasO = parseWord(line, 'O', outPos);
-
-  if (!(hasI || hasO)) {
-    Serial.println("Err: M704 needs I and/or O");
+  if (line.startsWith("M706"))
+  {
+    Serial.print("Pitch X=");
+    Serial.print(PITCH_X_MM);
+    Serial.print(" Y=");
+    Serial.println(PITCH_Y_MM);
     return;
   }
 
-  // 🔒 Safety limits (adjust to your machine travel)
-  if (hasI) {
-    if (inPos < 0 || inPos > 200) {
-      Serial.println("Err: Invalid C_IN (0–200 mm)");
-      return;
-    }
-    C_IN_MM = inPos;
+  if (line.startsWith("M707"))
+  {
+    Serial.print("Offsets X0=");
+    Serial.print(X0_OFFSET_MM);
+    Serial.print(" Y0=");
+    Serial.println(Y0_OFFSET_MM);
+    return;
   }
 
-  if (hasO) {
-    if (outPos < 0 || outPos > 200) {
-      Serial.println("Err: Invalid C_OUT (0–200 mm)");
-      return;
-    }
-    C_OUT_MM = outPos;
+  if (line.startsWith("M708"))
+  {
+    Serial.print("Camera IN=");
+    Serial.print(C_IN_MM);
+    Serial.print(" OUT=");
+    Serial.println(C_OUT_MM);
+    return;
   }
 
-  Serial.print("Camera positions updated: IN=");
-  Serial.print(C_IN_MM);
-  Serial.print(" OUT=");
-  Serial.println(C_OUT_MM);
+  if (line.startsWith("M709"))
+  {
+    Serial.print("GRID R=");
+    Serial.print(MAX_ROWS);
+    Serial.print(" C=");
+    Serial.print(MAX_COLS);
 
-  return;
-}
+    Serial.print(" | PITCH X=");
+    Serial.print(PITCH_X_MM);
+    Serial.print(" Y=");
+    Serial.print(PITCH_Y_MM);
 
+    Serial.print(" | OFFSET X0=");
+    Serial.print(X0_OFFSET_MM);
+    Serial.print(" Y0=");
+    Serial.print(Y0_OFFSET_MM);
 
-if (line.startsWith("M705")) {
-  Serial.print("ROWS=");
-  Serial.print(MAX_ROWS);
-  Serial.print(" COLS=");
-  Serial.println(MAX_COLS);
-  return;
-}
+    Serial.print(" | Camera IN=");
+    Serial.print(C_IN_MM);
+    Serial.print(" OUT=");
+    Serial.println(C_OUT_MM);
+    return;
+  }
 
+  if (line.startsWith("M799"))
+  {
+    Serial.print("LIMITS X=");
+    Serial.print(getMaxX());
 
-if (line.startsWith("M706")) {
-  Serial.print("Pitch X=");
-  Serial.print(PITCH_X_MM);
-  Serial.print(" Y=");
-  Serial.println(PITCH_Y_MM);
-  return;
-}
+    Serial.print(" Y=");
+    Serial.print(getMaxY());
 
+    Serial.print(" C=");
+    Serial.println(getMaxC());
 
-if (line.startsWith("M707")) {
-  Serial.print("Offsets X0=");
-  Serial.print(X0_OFFSET_MM);
-  Serial.print(" Y0=");
-  Serial.println(Y0_OFFSET_MM);
-  return;
-}
+    return;
+  }
 
+  if (line.startsWith("M500"))
+  {
+    saveSettings();
+    return;
+  }
 
-if (line.startsWith("M708")) {
-  Serial.print("Camera IN=");
-  Serial.print(C_IN_MM);
-  Serial.print(" OUT=");
-  Serial.println(C_OUT_MM);
-  return;
-}
+  if (line.startsWith("M501"))
+  {
+    loadSettings();
+    return;
+  }
 
-
-if (line.startsWith("M709")) {
-  Serial.print("GRID R=");
-  Serial.print(MAX_ROWS);
-  Serial.print(" C=");
-  Serial.print(MAX_COLS);
-
-  Serial.print(" | PITCH X=");
-  Serial.print(PITCH_X_MM);
-  Serial.print(" Y=");
-  Serial.print(PITCH_Y_MM);
-
-  Serial.print(" | OFFSET X0=");
-  Serial.print(X0_OFFSET_MM);
-  Serial.print(" Y0=");
-  Serial.print(Y0_OFFSET_MM);
-
-  Serial.print("Camera IN=");
-  Serial.print(C_IN_MM);
-  Serial.print(" OUT=");
-  Serial.println(C_OUT_MM);
-  return;
-}
-
-
-if (line.startsWith("M500")) {
-  saveSettings();
-  return;
-}
-
-if (line.startsWith("M501")) {
-  loadSettings();
-  return;
-}
-
-if (line.startsWith("M502")) {
-  resetSettings();
-  return;
-}
-
+  if (line.startsWith("M502"))
+  {
+    resetSettings();
+    return;
+  }
 
   // Linear motion commands
   bool isG0 = line.startsWith("G0") || line.startsWith("G00");
   bool isG1 = line.startsWith("G1") || line.startsWith("G01");
 
-  if (isG0 || isG1) {
+  if (isG0 || isG1)
+  {
 
+    float x = 0, y = 0, c = 0;
+    bool hasX = parseWord(line, 'X', x);
+    bool hasY = parseWord(line, 'Y', y);
+    bool hasC = parseWord(line, 'C', c);
 
-float x = 0, y = 0, c = 0;
-bool hasX = parseWord(line, 'X', x);
-bool hasY = parseWord(line, 'Y', y);
-bool hasC = parseWord(line, 'C', c);
+    float fx = 0, fy = 0, fc = 0;
+    bool hasFX = parseWordStr(line, "FX", fx);
+    bool hasFY = parseWordStr(line, "FY", fy);
+    bool hasFC = parseWordStr(line, "FC", fc);
 
-
-float fx = 0, fy = 0, fc = 0;
-bool hasFX = parseWordStr(line, "FX", fx);
-bool hasFY = parseWordStr(line, "FY", fy);
-bool hasFC = parseWordStr(line, "FC", fc);
-
-if (hasFX) feedrate_X_mm_per_min = fx;
-if (hasFY) feedrate_Y_mm_per_min = fy;
-if (hasFC) feedrate_C_mm_per_min = fc;
-
+    if (hasFX)
+      feedrate_X_mm_per_min = fx;
+    if (hasFY)
+      feedrate_Y_mm_per_min = fy;
+    if (hasFC)
+      feedrate_C_mm_per_min = fc;
 
     // Current positions in mm
     float tx = stepperX.currentPosition() / stepsPerMM_X;
     float ty =
-      ((stepperY1.currentPosition() + stepperY2.currentPosition()) * 0.5f)
-      / stepsPerMM_Y;
+        ((stepperY1.currentPosition() + stepperY2.currentPosition()) * 0.5f) / stepsPerMM_Y;
     float tc = stepperC.currentPosition() / stepsPerMM_C;
 
     // Apply absolute or relative motion
-    if (hasX) tx = absoluteMode ? x : (tx + x);
-    if (hasY) ty = absoluteMode ? y : (ty + y);
-    if (hasC) tc = absoluteMode ? c : (tc + c);
+    if (hasX)
+      tx = absoluteMode ? x : (tx + x);
+    if (hasY)
+      ty = absoluteMode ? y : (ty + y);
+    if (hasC)
+      tc = absoluteMode ? c : (tc + c);
 
     // Homing warnings
     if (hasY && !yHomed)
@@ -1828,6 +2096,3 @@ if (hasFC) feedrate_C_mm_per_min = fc;
   Serial.print("Unknown/unsupported: ");
   Serial.println(line);
 }
-
-
-

@@ -245,82 +245,68 @@ class Bridge:
         self._publish_layout_config()
 
     def _publish_layout_config(self) -> None:
-        """
-        Step 5 of the reconnect-cleanup sequence (Item 1).
-
-        Sends M705, M706, M707, M799 to the Arduino over serial, parses all
-        four responses, and publishes a single LAYOUT_CONFIG JSON payload to
-        the MQTT response topic. The server's _on_response_message handler
-        reads this and updates gantry_state + DB in a background thread.
-
-        Silently skips on any error so that a partial layout failure does not
-        abort the reconnect sequence.
-        """
-        try:
-            rows_line   = self.serial.send_command("M705")  # ROWS=12 COLS=7
-            pitch_line  = self.serial.send_command("M706")  # Pitch X=50.0 Y=50.0
-            offset_line = self.serial.send_command("M707")  # Offsets X0=0.0 Y0=0.0
-            limits_line = self.serial.send_command("M799")  # LIMITS X=300 Y=200 C=180
-        except Exception:
-            logger.exception("_publish_layout_config: serial error — skipping LAYOUT_CONFIG.")
-            return
-
-        payload: dict = {"type": "LAYOUT_CONFIG"}
-        parsed_any = False
-
-        # Parse M705: ROWS=12 COLS=7
-        if rows_line:
-            m = re.search(r'ROWS=(\d+)\s+COLS=(\d+)', rows_line, re.IGNORECASE)
-            if m:
-                payload["grid_rows"] = int(m.group(1))
-                payload["grid_cols"] = int(m.group(2))
-                parsed_any = True
-            else:
-                logger.warning("_publish_layout_config: could not parse M705 response: %r", rows_line)
-
-        # Parse M706: Pitch X=50.0 Y=50.0
-        if pitch_line:
-            m = re.search(r'Pitch\s+X=([-\d.]+)\s+Y=([-\d.]+)', pitch_line, re.IGNORECASE)
-            if m:
-                payload["pitch_x_mm"] = float(m.group(1))
-                payload["pitch_y_mm"] = float(m.group(2))
-                parsed_any = True
-            else:
-                logger.warning("_publish_layout_config: could not parse M706 response: %r", pitch_line)
-
-        # Parse M707: Offsets X0=0.0 Y0=0.0
-        if offset_line:
-            m = re.search(r'Offsets\s+X0=([-\d.]+)\s+Y0=([-\d.]+)', offset_line, re.IGNORECASE)
-            if m:
-                payload["x0_offset_mm"] = float(m.group(1))
-                payload["y0_offset_mm"] = float(m.group(2))
-                parsed_any = True
-            else:
-                logger.warning("_publish_layout_config: could not parse M707 response: %r", offset_line)
-
-        # Parse M799: LIMITS X=300.00 Y=200.00 C=180.00
-        if limits_line:
-            m = re.search(r'LIMITS\s+X=([-\d.]+)\s+Y=([-\d.]+)\s+C=([-\d.]+)', limits_line, re.IGNORECASE)
-            if m:
-                payload["limit_x_mm"] = float(m.group(1))
-                payload["limit_y_mm"] = float(m.group(2))
-                payload["limit_c_mm"] = float(m.group(3))
-                parsed_any = True
-            else:
-                logger.warning("_publish_layout_config: could not parse M799 response: %r", limits_line)
-
-        if parsed_any:
-            mqtt_client.publish_response(json.dumps(payload))
-            logger.info(
-                "LAYOUT_CONFIG published: rows=%s cols=%s pitch=(%s,%s) offset=(%s,%s) limits=(%s,%s,%s)",
-                payload.get("grid_rows"), payload.get("grid_cols"),
-                payload.get("pitch_x_mm"), payload.get("pitch_y_mm"),
-                payload.get("x0_offset_mm"), payload.get("y0_offset_mm"),
-                payload.get("limit_x_mm"), payload.get("limit_y_mm"), payload.get("limit_c_mm"),
-            )
-        else:
-            logger.warning("_publish_layout_config: no valid responses from Arduino — LAYOUT_CONFIG not published.")
-
+       try:
+           rows_line   = self.serial.send_command("M705")
+           pitch_line  = self.serial.send_command("M706")
+           offset_line = self.serial.send_command("M707")
+           # M799 removed — not implemented in firmware
+       except Exception:
+           logger.exception("_publish_layout_config: serial error — skipping LAYOUT_CONFIG.")
+           return
+   
+       payload: dict = {"type": "LAYOUT_CONFIG"}
+       parsed_any = False
+   
+       # Check for E-stop state — Arduino replies "E-stop" to all commands when stopped
+       ESTOP_STR = "e-stop"
+       for name, val in [("M705", rows_line), ("M706", pitch_line), ("M707", offset_line)]:
+           if val and val.strip().lower() == ESTOP_STR:
+               logger.warning(
+                   "_publish_layout_config: Arduino is in E-stop state "
+                   "— LAYOUT_CONFIG not published. Send M17 to re-enable."
+               )
+               return
+   
+       # Parse M705: ROWS=12 COLS=7
+       if rows_line:
+           m = re.search(r'ROWS=(\d+)\s+COLS=(\d+)', rows_line, re.IGNORECASE)
+           if m:
+               payload["grid_rows"] = int(m.group(1))
+               payload["grid_cols"] = int(m.group(2))
+               parsed_any = True
+           else:
+               logger.warning("_publish_layout_config: could not parse M705 response: %r", rows_line)
+   
+       # Parse M706: Pitch X=50.0 Y=50.0
+       if pitch_line:
+           m = re.search(r'Pitch\s+X=([-\d.]+)\s+Y=([-\d.]+)', pitch_line, re.IGNORECASE)
+           if m:
+               payload["pitch_x_mm"] = float(m.group(1))
+               payload["pitch_y_mm"] = float(m.group(2))
+               parsed_any = True
+           else:
+               logger.warning("_publish_layout_config: could not parse M706 response: %r", pitch_line)
+   
+       # Parse M707: Offsets X0=0.0 Y0=0.0
+       if offset_line:
+           m = re.search(r'Offsets\s+X0=([-\d.]+)\s+Y0=([-\d.]+)', offset_line, re.IGNORECASE)
+           if m:
+               payload["x0_offset_mm"] = float(m.group(1))
+               payload["y0_offset_mm"] = float(m.group(2))
+               parsed_any = True
+           else:
+               logger.warning("_publish_layout_config: could not parse M707 response: %r", offset_line)
+   
+       if parsed_any:
+           mqtt_client.publish_response(json.dumps(payload))
+           logger.info(
+               "LAYOUT_CONFIG published: rows=%s cols=%s pitch=(%s,%s) offset=(%s,%s)",
+               payload.get("grid_rows"), payload.get("grid_cols"),
+               payload.get("pitch_x_mm"), payload.get("pitch_y_mm"),
+               payload.get("x0_offset_mm"), payload.get("y0_offset_mm"),
+           )
+       else:
+           logger.warning("_publish_layout_config: no valid responses from Arduino — LAYOUT_CONFIG not published.")
     @staticmethod
     def _parse_homed_flags(m114_response: Optional[str]) -> Optional[dict[str, bool]]:
         """
