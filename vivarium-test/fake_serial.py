@@ -6,7 +6,7 @@ WHAT THIS DOES
 serial_handler.py calls `serial.Serial(port=..., baudrate=..., timeout=0.1)`
 directly inside connect(). This file provides a class — FakeSerial — that
 has the exact same methods pyserial's real Serial object has:
-    write(), read(), flush(), close(), is_open,
+    write(), read(), flush(), close(), open(), is_open,
     reset_input_buffer(), reset_output_buffer()
 
 We monkeypatch `serial.Serial` to point at FakeSerial BEFORE bridge.py /
@@ -17,13 +17,14 @@ thing that's fake is what's sitting "on the other end of the wire."
 
 FakeSerial behaves like a real Arduino running RackMonitor_Mega_IS_S.ino:
   - M114        -> "X:0.00 Y:0.00 C:0.00 homed:X=Y Y=Y C=Y"
-  - everything else -> "Yo! On my way!"
+  - M705        -> "ROWS=12 COLS=7"
+  - M706        -> "Pitch X=50.0 Y=50.0"
+  - M707        -> "Offsets X0=0.0 Y0=0.0"
+  - M799        -> "LIMITS X=300.00 Y=200.00 C=180.00"
+  - everything else -> "ok"   (NOT "Yo! On my way!" — that string is
+                               filtered as noise by serial_handler and
+                               would cause every motion command to time out)
   - commands listed in FAIL_COMMANDS -> silence (to trigger SERIAL_TIMEOUT)
-  - realistic reply latency via RESPONSE_DELAY_S (so retry/timeout logic in
-    serial_handler.py's _write_and_wait() is genuinely exercised, not skipped)
-
-This mirrors pi/tests/fake_arduino.py's response table exactly, just
-in-process instead of over a real/virtual wire.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ import threading
 import time
 from typing import Optional
 
-# Commands to silently drop — same env var fake_arduino.py uses, so you can
-# reuse muscle memory: FAIL_COMMANDS=G28 python pi/bridge.py
+# Commands to silently drop — trigger SERIAL_TIMEOUT path in serial_handler.
+# Usage: FAIL_COMMANDS=G28 python vivarium-test\run_bridge_test.py
 FAIL_COMMANDS: set[str] = {
     c.strip().upper()
     for c in os.environ.get("FAIL_COMMANDS", "").split(",")
@@ -43,19 +44,17 @@ FAIL_COMMANDS: set[str] = {
 }
 
 FAKE_M114 = "X:0.00 Y:0.00 C:0.00 homed:X=Y Y=Y C=Y"
-FAKE_ACK = "Yo! On my way!"
-
-# Layout-query replies — format copied EXACTLY from RackMonitor_Mega_IS_S.ino
-# (Serial.print calls for M705/M706/M707) and from bridge.py's M799 regex
-# comment, so bridge.py's _publish_layout_config() parses these for real
-# instead of falling into its "could not parse" warning branch.
 FAKE_M705 = "ROWS=12 COLS=7"
 FAKE_M706 = "Pitch X=50.0 Y=50.0"
 FAKE_M707 = "Offsets X0=0.0 Y0=0.0"
 FAKE_M799 = "LIMITS X=300.00 Y=200.00 C=180.00"
 
-# Simulated Arduino reply latency (seconds) — keep nonzero so the bridge's
-# real timeout/retry path is actually tested, not bypassed.
+# NOTE: "ok" not "Yo! On my way!" — serial_handler._write_and_wait() treats
+# "yo! on my way!" as firmware noise, discards it, and waits for a second
+# line that never comes → every motion command times out. "ok" passes through.
+FAKE_ACK = "ok"
+
+# Simulated Arduino reply latency (seconds).
 RESPONSE_DELAY_S = 0.05
 
 _FIXED_REPLIES = {
@@ -78,11 +77,11 @@ def _choose_response(command: str) -> Optional[str]:
 
 class FakeSerial:
     """
-    Drop-in stand-in for serial.Serial, used only when GANTRY_FAKE_SERIAL=1.
+    Drop-in stand-in for serial.Serial.
 
     Mimics the subset of pyserial's API that serial_handler.py actually uses:
         Serial(port=, baudrate=, timeout=)
-        .write(bytes) / .flush() / .read(n) / .close()
+        .write(bytes) / .flush() / .read(n) / .close() / .open()
         .is_open
         .reset_input_buffer() / .reset_output_buffer()
     """
@@ -96,9 +95,7 @@ class FakeSerial:
         # Bytes the "Arduino" has written, waiting to be .read() by the bridge.
         self._rx_queue: "queue.Queue[bytes]" = queue.Queue()
 
-        # Background "Arduino" worker thread: consumes commands written by
-        # the bridge, decides on a reply using the same table as
-        # pi/tests/fake_arduino.py, and pushes the reply into _rx_queue.
+        # Background "Arduino" worker thread.
         self._cmd_queue: "queue.Queue[str]" = queue.Queue()
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._arduino_loop, daemon=True)
@@ -110,7 +107,6 @@ class FakeSerial:
 
     # ── "Arduino" side ──────────────────────────────────────────────────
     def _arduino_loop(self) -> None:
-        buf = ""
         while not self._stop.is_set():
             try:
                 command = self._cmd_queue.get(timeout=0.1)
@@ -127,7 +123,26 @@ class FakeSerial:
             self._rx_queue.put((reply + "\n").encode("utf-8"))
             print(f"[fake_serial] -> TX: {reply!r}")
 
-    # ── pyserial-compatible API used by serial_handler.py ──────────────
+    # ── pyserial-compatible API ──────────────────────────────────────────
+
+    def open(self) -> None:
+        """
+        Called by serial_handler.connect() after the ttyACM bootloader wait
+        (close() → sleep(9) → open()). Re-opens the fake port and restarts
+        the worker thread if close() killed it.
+        """
+        self.is_open = True
+        if self._stop.is_set():
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._arduino_loop, daemon=True)
+            self._worker.start()
+        print("[fake_serial] open() called — fake port re-opened.")
+
+    def close(self) -> None:
+        self.is_open = False
+        self._stop.set()
+        print("[fake_serial] close() called — fake port closed.")
+
     def write(self, data: bytes) -> int:
         text = data.decode("utf-8", errors="replace").strip()
         if text:
@@ -140,8 +155,7 @@ class FakeSerial:
     def read(self, size: int = 1) -> bytes:
         """
         Mimics pyserial: blocks up to self.timeout seconds, returns whatever
-        bytes are available (possibly empty). serial_handler.py's reader
-        loop calls read(256) in a tight poll loop, same as on a real port.
+        bytes are available (possibly empty).
         """
         deadline = time.time() + self.timeout
         chunks = b""
@@ -168,15 +182,11 @@ class FakeSerial:
             except queue.Empty:
                 break
 
-    def close(self) -> None:
-        self.is_open = False
-        self._stop.set()
-
 
 def install_fake_serial() -> None:
     """
     Monkeypatch serial.Serial -> FakeSerial. Call this BEFORE importing
-    bridge.py / serial_handler.py (see run_bridge_test.py).
+    bridge.py / serial_handler.py.
     """
     import serial
     serial.Serial = FakeSerial

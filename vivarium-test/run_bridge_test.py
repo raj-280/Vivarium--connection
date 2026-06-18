@@ -17,25 +17,24 @@ Requires device.conf already provisioned (see step-by-step below) and the
 serial_port value in it can be left as the placeholder /dev/ttyACM0 — it is
 never actually opened, FakeSerial ignores the value.
 """
-
+#!/usr/bin/env python3
 import os
 import sys
 from pathlib import Path
 
-# 1. Make the fake_serial.py module importable, then patch serial.Serial
-#    BEFORE anything under pi/ gets imported.
+# 1. Add vivarium-test/ to sys.path so fake_serial.py is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fake_serial import install_fake_serial  # noqa: E402
+from fake_serial import install_fake_serial   # no dotted import — just direct
 install_fake_serial()
 
-# 2. Put pi/ on sys.path exactly like bridge.py expects when run directly.
+# 2. Add pi/ to sys.path so bridge.py can import its own modules
 repo_root = Path(__file__).resolve().parent.parent
 pi_dir = repo_root / "pi"
 sys.path.insert(0, str(pi_dir))
 
-# 3. Run the REAL bridge — same entrypoint as `python pi/bridge.py`.
+# 3. Run the real bridge
 if __name__ == "__main__":
-    import bridge  # pi/bridge.py, unmodified
+    import bridge
     b = bridge.Bridge()
     b.start()
     b.run_forever()
