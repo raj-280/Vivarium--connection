@@ -6,9 +6,12 @@ pi/config/settings.py
 from __future__ import annotations
 
 import configparser
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ── Path resolution ────────────────────────────────────────────────────────
@@ -20,12 +23,27 @@ ENV_OVERRIDE_VAR = "GANTRY_DEVICE_CONF"
 def _resolve_conf_path() -> str:
     """
     Resolution order:
-      1. GANTRY_DEVICE_CONF env var (local testing — no root required)
-      2. /etc/gantry/device.conf (real Pi deployment)
+      1. GANTRY_DEVICE_CONF env var  (local dev — set this to any path)
+      2. /etc/gantry/device.conf     (real Pi deployment, provisioned by setup.sh)
+      3. device.conf next to this settings.py file  (development fallback —
+         works automatically when running from the repo root without any .env
+         or system-level install, e.g. `python -m pi.bridge` in the repo dir)
     """
     override = os.environ.get(ENV_OVERRIDE_VAR)
     if override:
         return override
+
+    if Path(DEFAULT_DEVICE_CONF_PATH).is_file():
+        return DEFAULT_DEVICE_CONF_PATH
+
+    # Development fallback: look for device.conf in the same directory as
+    # this settings.py file (i.e. pi/config/device.conf).
+    local_conf = Path(__file__).parent / "device.conf"
+    if local_conf.is_file():
+        return str(local_conf)
+
+    # No file found — return the default path anyway; Settings.__init__ will
+    # detect loaded_from_file=False and log a warning, then use _DEFAULTS.
     return DEFAULT_DEVICE_CONF_PATH
 
 

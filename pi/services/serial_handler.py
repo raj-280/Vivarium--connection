@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import queue
 import threading
 import time
 from typing import Callable, Optional
@@ -75,11 +76,25 @@ _AUTO_PORT_GLOBS = ["/dev/ttyACM*", "/dev/ttyUSB*"]
 # Interval between reconnect attempts (seconds)
 _RECONNECT_RETRY_INTERVAL_S = 3.0
 
-# Firmware debug lines that must never be delivered as a command response.
-# The Arduino firmware emits these immediately before the real response line,
-# for EVERY command (see module docstring above). Filtering happens inside
-# _write_and_wait()'s wait loop — see that method for details.
-_NOISE_LINES: frozenset[str] = frozenset(["yo! on my way!"])
+# Firmware noise substrings — any response line whose stripped, lower-cased
+# content CONTAINS one of these strings is treated as a noise echo and
+# discarded inside _write_and_wait()'s drain loop.
+#
+# Background: the Arduino firmware (RackMonitor_Mega_IS_S.ino line 1566)
+# unconditionally calls Serial.println("Yo! On my way!") for EVERY command
+# it receives, BEFORE it processes or responds to that command.  This means
+# every command produces two serial lines:
+#   1.  "Yo! On my way!"   ← firmware echo / noise
+#   2.  The real response  ← e.g. "ROWS=12 COLS=7" for M705
+#
+# We use substring containment (not exact-string membership) so that minor
+# firmware wording tweaks (extra whitespace, different capitalisation, or
+# the line arriving in a partial read() chunk that was later reassembled)
+# are all caught without code changes.
+_NOISE_SUBSTRINGS: tuple[str, ...] = (
+    "yo! on my way!",
+    "on my way",       # catch partial or differently-worded echoes
+)
 
 
 class SerialHandler:
@@ -118,9 +133,22 @@ class SerialHandler:
         self._stop_reader = threading.Event()
 
         # Synchronisation for send_command() ↔ _reader_loop()
+        # NOTE (race fix — see _route_response / _write_and_wait docstrings):
+        # we used to store at most ONE pending line in a plain attribute
+        # (self._pending_response) guarded by self._write_lock. When the
+        # firmware noise line ("Yo! On my way!") and the real response line
+        # arrive in the SAME read() chunk, _reader_loop() calls
+        # _route_response() for both lines back-to-back with no gap for the
+        # consumer (_write_and_wait) to wake up in between. That meant the
+        # second line could silently overwrite/bypass the first before it
+        # was ever read, and the real response got misrouted as unsolicited
+        # while only the noise line was ever delivered to send_command().
+        # Fix: route EVERY line into a small FIFO queue. The reader thread
+        # never blocks or guesses at consumer state; the consumer drains the
+        # queue and discards noise lines itself, against its own timeout
+        # budget. No line can ever be dropped or overwritten again.
         self._write_lock = threading.Lock()
-        self._response_event = threading.Event()
-        self._pending_response: Optional[str] = None
+        self._response_queue: "queue.Queue[str]" = queue.Queue()
         self._waiting_for_response = False
 
         # Emergency-stop flag — set by emergency_stop(), cleared on next connect
@@ -278,13 +306,19 @@ class SerialHandler:
                 if not chunk:
                     continue
 
+                # DIAGNOSTIC: log every raw chunk exactly as it comes off the
+                # wire, before any line-splitting. Proves whether multiple
+                # lines arrive together, and whether the real response ever
+                # physically reaches the Pi at all.
+                logger.info("Serial RAW chunk: %r", chunk)
+
                 buffer += chunk
                 while b"\n" in buffer:
                     line_bytes, buffer = buffer.split(b"\n", 1)
                     line = line_bytes.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    logger.debug("Serial RX: %r", line)
+                    logger.info("Serial RX line: %r", line)
                     self._route_response(line)
 
             except serial.SerialException:
@@ -292,9 +326,8 @@ class SerialHandler:
                 self._stop_reader.set()
                 # Unblock any waiting send_command()
                 with self._write_lock:
-                    self._pending_response = None
                     self._waiting_for_response = False
-                    self._response_event.set()
+                self._response_queue.put("")  # sentinel: wakes a blocked get()
                 break
             except Exception:
                 logger.exception("_reader_loop: unexpected error")
@@ -306,24 +339,28 @@ class SerialHandler:
         """
         Called from _reader_loop with each complete line.
 
-        If send_command() is waiting, deliver the line as its response —
-        this includes firmware noise lines (e.g. "Yo! On my way!"). Noise
-        filtering happens in _write_and_wait()'s wait loop instead of here,
-        because only the waiter knows how much of its timeout budget is
-        left; filtering at this layer with a bare "return" would silently
-        eat part of the response window and could cause the REAL response
-        line (which follows the noise line) to arrive after
-        _waiting_for_response has already been reset, misrouting it as
-        unsolicited (Section 5.2 patch — see module docstring).
+        If send_command() is waiting, queue the line as a candidate response
+        — this includes firmware noise lines (e.g. "Yo! On my way!"). Noise
+        filtering happens in _write_and_wait()'s drain loop instead of here
+        (see module docstring). Every line is pushed onto self._response_queue
+        in arrival order; nothing is ever overwritten or dropped, even if two
+        lines (noise + real response) arrive in the same read() chunk with no
+        gap for the consumer thread to wake up in between (Section 5.2 patch
+        — race fix, June 2026).
 
         If nothing is waiting, call on_unsolicited() if registered.
         """
         with self._write_lock:
-            if self._waiting_for_response:
-                self._pending_response = line
-                self._waiting_for_response = False
-                self._response_event.set()
-                return
+            waiting = self._waiting_for_response
+
+        # DIAGNOSTIC: log the routing decision for every line so we can see
+        # whether the real response ever reaches the "waiting" branch or
+        # gets dropped into "unsolicited" instead.
+        logger.info("Serial ROUTE: line=%r waiting=%s", line, waiting)
+
+        if waiting:
+            self._response_queue.put(line)
+            return
 
         # Not waiting — unsolicited message
         if self.on_unsolicited:
@@ -332,7 +369,7 @@ class SerialHandler:
             except Exception:
                 logger.exception("on_unsolicited callback raised")
         else:
-            logger.debug("Serial unsolicited: %r", line)
+            logger.info("Serial unsolicited (dropped): %r", line)
 
     # ── Core send/receive ────────────────────────────────────────────────
 
@@ -373,54 +410,71 @@ class SerialHandler:
         """
         Write one line, signal the reader thread to capture the response, wait.
 
-        Waits in a loop against a single deadline (self.timeout_s total,
-        not per-line). If the line that arrives is firmware noise (e.g.
-        "Yo! On my way!" — see module docstring), it's discarded and we
-        re-arm _waiting_for_response and keep waiting on whatever time is
-        left in the SAME timeout window, instead of returning the noise
-        line as if it were the real response.
+        Waits against a single deadline (self.timeout_s total, not per-line).
+        Drains self._response_queue as lines arrive. If a line is firmware
+        noise (e.g. "Yo! On my way!" — see module docstring), it's discarded
+        and we keep draining on whatever time is left in the SAME timeout
+        window, instead of returning the noise line as if it were the real
+        response.
+
+        Race fix (Section 5.2 patch — June 2026): every line _reader_loop
+        sees while we're waiting goes into a FIFO queue (see _route_response),
+        so even if the noise line and the real response arrive back-to-back
+        in the same read() chunk before we get a chance to process the first
+        one, both lines are preserved in order and neither is ever dropped
+        or overwritten.
         """
         assert self._serial is not None
 
-        with self._write_lock:
-            # Arm the response event before writing so we can't miss a fast reply
-            self._pending_response = None
-            self._response_event.clear()
-            self._waiting_for_response = True
+        # Drain any stale lines left over from a previous call (e.g. a late
+        # arrival after a previous timeout) so they can't be misread as this
+        # command's response.
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except queue.Empty:
+                break
 
+        with self._write_lock:
+            self._waiting_for_response = True
             line = command.strip() + "\n"
             self._serial.write(line.encode("utf-8"))
             self._serial.flush()
             logger.debug("Serial TX: %r", command.strip())
 
-        # Wait outside the lock so the reader thread can acquire it to deliver.
-        deadline = time.time() + self.timeout_s
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                with self._write_lock:
-                    self._waiting_for_response = False
-                return None
+        try:
+            deadline = time.time() + self.timeout_s
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    logger.info("_write_and_wait(%r): deadline expired, no more data", command.strip())
+                    return None
 
-            signalled = self._response_event.wait(timeout=remaining)
-            if not signalled:
-                # Timeout — disarm the waiter flag
-                with self._write_lock:
-                    self._waiting_for_response = False
-                return None
+                try:
+                    result = self._response_queue.get(timeout=remaining)
+                except queue.Empty:
+                    logger.info("_write_and_wait(%r): queue.get timed out", command.strip())
+                    return None
 
-            with self._write_lock:
-                result = self._pending_response
-                self._pending_response = None
-                self._response_event.clear()
-                if result is not None and result.strip().lower() in _NOISE_LINES:
-                    # Firmware echo — discard and keep waiting on the
-                    # remaining budget for the real response line.
-                    logger.debug("Serial RX: discarded firmware echo %r, still waiting", result)
-                    self._waiting_for_response = True
+                logger.info("_write_and_wait(%r): pulled from queue: %r", command.strip(), result)
+
+                # ── Noise / sentinel check ─────────────────────────────────
+                # An empty string is the disconnect sentinel from _reader_loop
+                # (SerialException) or emergency_stop().  A non-empty line is
+                # noise if its lower-cased content contains any of the known
+                # firmware echo substrings (e.g. "Yo! On my way!").
+                # We use substring containment, not exact-string membership,
+                # so minor firmware wording changes cannot break filtering.
+                _stripped = result.strip().lower()
+                if not _stripped or any(n in _stripped for n in _NOISE_SUBSTRINGS):
+                    logger.info("_write_and_wait(%r): discarding noise %r, still waiting", command.strip(), result)
                     continue
 
-            return result
+                logger.info("_write_and_wait(%r): returning %r as real response", command.strip(), result)
+                return result
+        finally:
+            with self._write_lock:
+                self._waiting_for_response = False
 
     # ── Emergency stop ────────────────────────────────────────────────────
 
@@ -438,8 +492,7 @@ class SerialHandler:
         # Unblock any waiting send_command()
         with self._write_lock:
             self._waiting_for_response = False
-            self._pending_response = None
-            self._response_event.set()
+        self._response_queue.put("")  # sentinel: drained and discarded as noise
 
         if self._serial and self._serial.is_open:
             try:
@@ -455,10 +508,15 @@ class SerialHandler:
 
     # ── Health check ──────────────────────────────────────────────────────
 
-    def health_check(self) -> bool:
+    def health_check(self) -> Optional[str]:
         """
-        Send M114 and return True if any response is received within the
-        normal timeout/retry window. Used by the reconnect-cleanup sequence.
+        Send M114 and return the raw response string if a response arrives
+        within the normal timeout/retry window, or None on timeout.
+
+        Returning the raw string (rather than a plain bool) lets the caller
+        reuse the M114 text for homed-flag parsing without a second serial
+        round-trip.  A non-None return means the Arduino is healthy.
+
+        Used by the reconnect-cleanup sequence in bridge.py.
         """
-        response = self.send_command("M114")
-        return response is not None
+        return self.send_command("M114")

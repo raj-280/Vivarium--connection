@@ -32,7 +32,7 @@ Run:
 or:
     python pi/bridge.py     (with pi/ on PYTHONPATH, see systemd units)
 """
-
+ 
 from __future__ import annotations
 
 import glob
@@ -46,7 +46,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
-
+ 
 # Allow running as either `python pi/bridge.py` (cwd = repo root, pi/ added
 # to sys.path below) or `python -m pi.bridge` (proper package import).
 if __package__ in (None, ""):
@@ -64,83 +64,83 @@ else:
     from .services.camera_handler import camera_handler      # Stage 9
     from .services.go2rtc_health import go2rtc_health        # Stage 10
     from .services.scan_executor import ScanExecutor         # Stage 11
-
-
+ 
+ 
 logging.basicConfig(
     level=os.environ.get("GANTRY_LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("bridge")
-
-
+ 
+ 
 # ── Constants ─────────────────────────────────────────────────────────────
-
+ 
 HEARTBEAT_INTERVAL_S = 30.0
-
+ 
 # Commands intercepted by the bridge — never forwarded to the Arduino.
 # Section 5.2 / 5.4 / 5.5 / Section 6 ("CAPTURE never reaches the Arduino").
 INTERCEPTED_COMMANDS = {"CAPTURE", "SCAN_START", "SCAN_STOP"}
-
-
+ 
+ 
 # ── Bridge ────────────────────────────────────────────────────────────────
-
+ 
 class Bridge:
     """
     Coordinates the MQTT <-> serial link for one rack.
-
+ 
     Stage 7 scope: command ACK/forward/response flow, heartbeat, and the
     reconnect cleanup sequence. CAPTURE / SCAN_START / SCAN_STOP are
     intercepted and logged only — their real implementations land in
     Stages 10 and 12.
     """
-
+ 
     def __init__(self) -> None:
         self.device_id = settings.device_id
         self.serial = SerialHandler()
         self._stop_event = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
-
+ 
         # Tracks whether _on_connect has fired before, so the reconnect
         # cleanup sequence runs on every (re)connect, including the first.
         self._first_connect_done = False
-
+ 
         # Start go2rtc health polling in the background so heartbeats can
         # read camera_status cheaply from the cache (Section 5.6 / Stage 10).
         go2rtc_health.start_background_polling()
-
+ 
         # Scan executor — shares this bridge's serial port (Section 5.5).
         # One instance per Bridge; scan lock enforces a single active scan.
         self._scan_executor = ScanExecutor(self.serial)
-
+ 
     # ── Lifecycle ─────────────────────────────────────────────────────────
-
+ 
     def start(self) -> None:
         logger.info("Starting bridge for device_id=%s", self.device_id)
         logger.info("Settings: %r", settings)
-
+ 
         # Open the serial link to the Arduino (or, for Stage 7 testing, to
         # the socat virtual-port echo script).
         self.serial.connect()
-
+ 
         # Register MQTT handlers before connecting so nothing is missed.
         mqtt_client.register_handler("command", self._on_command)
         mqtt_client.register_handler("emergency", self._on_emergency)
         mqtt_client.register_handler("broadcast", self._on_broadcast)
-
+ 
         # Hook into paho's on_connect via a wrapper so we can run the
         # reconnect-cleanup sequence on every (re)connect, not just the first.
         self._wrap_on_connect()
-
+ 
         mqtt_client.connect()
-
+ 
         # Start heartbeat loop
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop, name="heartbeat", daemon=True
         )
         self._heartbeat_thread.start()
-
+ 
         logger.info("Bridge started. Waiting for commands…")
-
+ 
     def stop(self) -> None:
         logger.info("Stopping bridge…")
         self._stop_event.set()
@@ -149,25 +149,25 @@ class Bridge:
         mqtt_client.disconnect()
         self.serial.disconnect()
         logger.info("Bridge stopped.")
-
+ 
     def run_forever(self) -> None:
         """Block until SIGINT/SIGTERM (Ctrl+C or systemd stop)."""
-
+ 
         def _handle_signal(signum, frame):
             logger.info("Received signal %s — shutting down.", signum)
             self._stop_event.set()
-
+ 
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
-
+ 
         try:
             while not self._stop_event.is_set():
                 time.sleep(0.5)
         finally:
             self.stop()
-
+ 
     # ── Reconnect cleanup sequence (Section 5.2) ─────────────────────────
-
+ 
     def _wrap_on_connect(self) -> None:
         """
         Wrap mqtt_client's internal _on_connect so the reconnect-cleanup
@@ -175,7 +175,7 @@ class Bridge:
         the very first connect.
         """
         original_on_connect = mqtt_client._on_connect
-
+ 
         def wrapped(client, userdata, flags, rc):
             original_on_connect(client, userdata, flags, rc)
             if rc == 0:
@@ -184,9 +184,9 @@ class Bridge:
                 threading.Thread(
                     target=self._reconnect_cleanup, name="reconnect-cleanup", daemon=True
                 ).start()
-
+ 
         mqtt_client._client.on_connect = wrapped
-
+ 
     def _reconnect_cleanup(self) -> None:
         """
         Section 5.2 reconnect cleanup, run on every connect/reconnect:
@@ -199,25 +199,26 @@ class Bridge:
         which = "initial connect" if not self._first_connect_done else "reconnect"
         logger.info("Running reconnect-cleanup sequence (%s)…", which)
         self._first_connect_done = True
-
-        # 1. Arduino health check
-        healthy = False
+ 
+        # 1. Arduino health check — health_check() now returns the raw M114
+        # response string (or None on timeout) so we reuse it for the
+        # homed-flag verify step below WITHOUT a second serial round-trip.
+        # Sending M114 twice in rapid succession caused the second “Yo! On my
+        # way!” echo to contaminate the response window of the first layout
+        # query (M705), producing spurious parse-warnings in the logs.
         m114_response: Optional[str] = None
+        healthy = False
         try:
-            healthy = self.serial.health_check()
-            if healthy:
-                # health_check() already sent M114 internally; send once
-                # more here so we have the raw response text for the
-                # homed-flag verify step. (Cheap — single round trip.)
-                m114_response = self.serial.send_command("M114")
+            m114_response = self.serial.health_check()   # raw M114 str or None
+            healthy = m114_response is not None
         except Exception:
             logger.exception("Arduino health check failed during reconnect cleanup.")
-
+ 
         if healthy:
             logger.info("Arduino health check: OK")
         else:
             logger.warning("Arduino health check: NO RESPONSE")
-
+ 
         # 2. Homed-flag verify
         homed = self._parse_homed_flags(m114_response)
         if homed is not None:
@@ -227,23 +228,28 @@ class Bridge:
             )
         else:
             logger.info("Homed-flag verify: no M114 response to parse (skipped).")
-
+ 
         # 3. /tmp sweep — delete leftover rack-*-*.jpg
         swept = self._sweep_tmp()
         if swept:
             logger.info("/tmp sweep: removed %d leftover capture file(s): %s", len(swept), swept)
         else:
             logger.info("/tmp sweep: nothing to clean up.")
-
+ 
         # 4. Publish BRIDGE_RECONNECTED
         mqtt_client.publish_response(f"BRIDGE_RECONNECTED:{which}")
         logger.info("Reconnect-cleanup sequence complete — published BRIDGE_RECONNECTED.")
-
-        # 5. Query layout + limits, publish LAYOUT_CONFIG
-        # The server listens for LAYOUT_CONFIG and updates gantry_state + DB.
-        # This is the single canonical payload — no layout_cache.py needed.
+ 
+        # 5. Query layout + limits, publish LAYOUT_CONFIG.
+        # A brief pause gives the Arduino’s serial TX buffer time to flush any
+        # remaining bytes from the M114 round-trip above before we open the
+        # M705/M706/M707 response windows.  This prevents the M114 real-response
+        # line (arriving slightly late) from being swallowed by M705’s waiter
+        # before _waiting_for_response is set, and prevents the M705 “Yo!” echo
+        # from arriving AFTER the window opens and being routed as unsolicited.
+        time.sleep(0.3)
         self._publish_layout_config()
-
+ 
     def _publish_layout_config(self) -> None:
        try:
            rows_line   = self.serial.send_command("M705")
@@ -314,19 +320,19 @@ class Bridge:
             "X:0.00 Y:0.00 C:0.00 homed:X=Y Y=Y C=N"
         Returns {"homed_x": bool, "homed_y": bool, "homed_c": bool} or None
         if the response doesn't contain a recognisable "homed:" section.
-
+ 
         This is a best-effort informational parse for Stage 7 logging only —
         the authoritative homed-flag check lives in
         server/services/position_monitor.py (Section 4.4).
         """
         if not m114_response:
             return None
-
+ 
         marker = "homed:"
         idx = m114_response.lower().find(marker)
         if idx == -1:
             return None
-
+ 
         segment = m114_response[idx + len(marker):].strip()
         flags = {"homed_x": False, "homed_y": False, "homed_c": False}
         for token in segment.split():
@@ -341,14 +347,14 @@ class Bridge:
                 flags["homed_y"] = is_homed
             elif axis == "C":
                 flags["homed_c"] = is_homed
-
+ 
         return flags
-
+ 
     @staticmethod
     def _sweep_tmp() -> list[str]:
         """
         Delete any leftover rack-*-*.jpg files in /tmp (Section 5.2 / 5.4).
-
+ 
         On the real Pi, /tmp is tmpfs (RAM only, tmp_is_tmpfs=true in
         device.conf) and capture files are named rack-{id}-{timestamp}.jpg
         per Section 5.4. This sweep catches files left behind by a crash
@@ -364,9 +370,9 @@ class Bridge:
             except OSError:
                 logger.exception("Failed to remove leftover capture file: %s", path)
         return removed
-
+ 
     # ── Heartbeat (Section 5.2 / 11) ─────────────────────────────────────
-
+ 
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -378,13 +384,13 @@ class Bridge:
                 if self._stop_event.is_set():
                     return
                 time.sleep(0.5)
-
+ 
     def _publish_heartbeat(self) -> None:
         # Read camera_status from the cached result of the go2rtc health check
         # (Section 5.6). The health thread updates this every 30s in the
         # background — calling last_status here is non-blocking.
         camera_status = go2rtc_health.last_status
-
+ 
         payload = {
             "status": "online",
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -393,13 +399,13 @@ class Bridge:
         }
         mqtt_client.publish_status(payload)
         logger.debug("Heartbeat published: %s", payload)
-
+ 
     # ── Command handling (Section 5.2) ───────────────────────────────────
-
+ 
     def _on_command(self, subtopic: str, payload: Any) -> None:
         """
         Handle vivarium/rack/{id}/command messages.
-
+ 
         Order of operations is critical (Section 5.2 / 4.5):
           1. Publish COMMAND_ACK:{command} immediately — BEFORE touching
              serial. This is the "Pi got it" signal.
@@ -412,12 +418,12 @@ class Bridge:
         if command is None:
             logger.warning("Received command message with no usable command: %r", payload)
             return
-
+ 
         logger.info("Command received: %r", command)
-
+ 
         # Step 1 — ACK immediately, before forwarding to serial (Section 5.2).
         mqtt_client.publish_response(f"COMMAND_ACK:{command}")
-
+ 
         # Step 2 — intercepted commands never reach the Arduino.
         base_command = command.split()[0].upper() if command.strip() else ""
         if base_command in INTERCEPTED_COMMANDS:
@@ -431,7 +437,7 @@ class Bridge:
                     daemon=True,
                 ).start()
                 logger.info("CAPTURE dispatched to camera_handler thread.")
-
+ 
             elif base_command == "SCAN_START":
                 # Parse optional payload fields for resume/session tracking.
                 payload_dict: dict = {}
@@ -444,7 +450,7 @@ class Bridge:
                     except Exception:
                         pass
                 payload_dict["rack_id"] = self.device_id
-
+ 
                 # Dispatch scan in a daemon thread — must share self.serial.
                 threading.Thread(
                     target=self._scan_executor.start,
@@ -453,21 +459,21 @@ class Bridge:
                     daemon=True,
                 ).start()
                 logger.info("SCAN_START dispatched to scan_executor thread.")
-
+ 
             elif base_command == "SCAN_STOP":
                 # Graceful stop between cells (Section 5.5 / 4.8).
                 self._scan_executor.request_stop()
                 logger.info("SCAN_STOP forwarded to scan_executor.")
-
+ 
             return
-
+ 
         # Step 3 — forward everything else to the Arduino.
         self._forward_to_serial(command)
-
+ 
     def _on_emergency(self, subtopic: str, payload: Any) -> None:
         """
         Handle vivarium/rack/{id}/emergency (QoS 2, "!" only).
-
+ 
         Emergency stop is fire-and-forget (Item 6) — we call
         serial.emergency_stop() which flushes buffers and writes !\n without
         blocking on a readline(). This ensures E-stop is never delayed by an
@@ -478,17 +484,17 @@ class Bridge:
         mqtt_client.publish_response(f"COMMAND_ACK:{command}")
         # Fire-and-forget — do NOT call _forward_to_serial which blocks on readline
         self.serial.emergency_stop()
-
+ 
     def _on_broadcast(self, subtopic: str, payload: Any) -> None:
         """Handle vivarium/all/command — same flow as a normal command."""
         logger.info("Broadcast command received: %r", payload)
         self._on_command(subtopic, payload)
-
+ 
     def _forward_to_serial(self, command: str) -> None:
         """
         Forward `command` to the Arduino and publish its response (or
         SERIAL_TIMEOUT:{command} if both attempts in serial_handler time out).
-
+ 
         On SerialException (USB disconnect), triggers the reconnect loop in a
         daemon thread (Item 2) and publishes SERIAL_TIMEOUT so the server can
         escalate appropriately.
@@ -512,12 +518,12 @@ class Bridge:
             logger.exception("Serial error while forwarding command %r", command)
             mqtt_client.publish_response(f"SERIAL_TIMEOUT:{command}")
             return
-
+ 
         if response is None:
             mqtt_client.publish_response(f"SERIAL_TIMEOUT:{command}")
         else:
             mqtt_client.publish_response(response)
-
+ 
     @staticmethod
     def _extract_command(payload: Any) -> Optional[str]:
         """
@@ -532,15 +538,15 @@ class Bridge:
             if isinstance(cmd, str):
                 return cmd.strip() or None
         return None
-
-
+ 
+ 
 # ── Entry point ───────────────────────────────────────────────────────────
-
+ 
 def main() -> None:
     bridge = Bridge()
     bridge.start()
     bridge.run_forever()
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
