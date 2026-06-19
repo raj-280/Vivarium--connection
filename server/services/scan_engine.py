@@ -45,6 +45,15 @@ Emergency stop integration (Section 4.8)
     3. Release the scan lock.
     4. Do NOT re-schedule; a G28 is required before any further motion
        (enforced by position_monitor's stale-homing check on next M114).
+
+FIXES applied in this version
+──────────────────────────────
+• Mismatch 1 (server side): on_scan_progress now reads cell_row/cell_col
+  (not row/col) from the Pi payload, matching the renamed Pi keys and the
+  frontend WsMsgScanCellComplete type.
+• Mismatch 3: _offer_resume_restart now sends expires_at (ISO timestamp
+  string) instead of timeout_s (raw integer seconds), matching the frontend
+  WsMsgScanResumePrompt.data.expires_at field.
 """
 
 from __future__ import annotations
@@ -52,7 +61,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -282,6 +291,10 @@ class ScanEngine:
         Handler for vivarium/rack/{id}/scan_progress.
         Updates scan_sessions and broadcasts scan_cell_complete to all
         WebSocket subscribers of the rack.
+
+        FIX (Mismatch 1 server side): reads cell_row/cell_col (not row/col)
+        from the Pi payload. The Pi's scan_executor now sends cell_row/cell_col
+        and the frontend WsMsgScanCellComplete.data uses the same keys.
         """
         if rack_id is None:
             return
@@ -295,8 +308,9 @@ class ScanEngine:
             return
 
         session_id: Optional[int] = payload.get("scan_session_id")
-        row: Optional[int] = payload.get("row")
-        col: Optional[int] = payload.get("col")
+        # FIX (Mismatch 1): use cell_row/cell_col, not row/col
+        row: Optional[int] = payload.get("cell_row")
+        col: Optional[int] = payload.get("cell_col")
         cells_completed: int = int(payload.get("cells_completed", 0))
         cells_failed: int = int(payload.get("cells_failed", 0))
 
@@ -320,6 +334,7 @@ class ScanEngine:
             logger.exception("on_scan_progress DB error for rack=%s", rack_id)
 
         # Broadcast scan_cell_complete to all rack subscribers (Section 4.3)
+        # The payload already has cell_row/cell_col so the frontend reads them correctly.
         try:
             from api.websocket import ws_registry
             ws_registry.broadcast_from_thread(
@@ -435,11 +450,6 @@ class ScanEngine:
         """
         Called by command_handler when a manual command arrives while
         racks.scan_state=running.
-
-        Steps per Section 4.8:
-          1. Set racks.scan_state = "paused" immediately.
-          2. Publish SCAN_STOP to the Pi (Pi finishes current cell, then stops).
-          (on_scan_status "paused" will then call _offer_resume_restart.)
         """
         logger.info(
             "ScanEngine: manual command conflict for rack=%s — pausing scan.", rack_id
@@ -454,7 +464,6 @@ class ScanEngine:
                 if rack:
                     rack.scan_state = "paused"
 
-            # Publish SCAN_STOP; Pi stops between cells and publishes scan_status=paused
             mqtt_client.publish_command(rack_id, "SCAN_STOP")
 
         except Exception:
@@ -491,19 +500,12 @@ class ScanEngine:
                 rack_id, session_id, resume_row, resume_col,
             )
         else:
-            # Restart — fresh start (no resume fields)
             self._publish_scan_start(rack_id, None, grid_rows, grid_cols)
             logger.info("ScanEngine: RESTART published for rack=%s", rack_id)
 
     def trigger_manual_scan(self, rack_id: str, user_id: str, db) -> str:
         """
         Operator-initiated SCAN_START (Section 4.7 / 4.8).
-
-        Called from command_handler when the REST/WS route receives SCAN_START.
-        Unlike the APScheduler job (_try_fire_scan), this does NOT check the
-        'next_scan_at' schedule gate — the operator explicitly requested a scan.
-        Gate b (rack-not-locked) still applies via acquire_lock below.
-
         Returns: "published" | "queued" | "error:<reason>"
         """
         try:
@@ -512,7 +514,6 @@ class ScanEngine:
 
             now = datetime.utcnow()
 
-            # Gate a: Pi online
             state = gantry_state.get(rack_id)
             pi_alive = state is not None and state.mqtt_status == "online"
             if not pi_alive:
@@ -528,7 +529,6 @@ class ScanEngine:
             if lock_result != LockResult.ACQUIRED:
                 return f"error:lock_{lock_result}"
 
-            # Create scan session
             session = ScanSession(
                 rack_id=rack_id,
                 status="running",
@@ -578,7 +578,18 @@ class ScanEngine:
         grid_rows: int,
         grid_cols: int,
     ) -> None:
-        """Push resume/restart prompt to the operator and start the window timer."""
+        """
+        Push resume/restart prompt to the operator and start the window timer.
+
+        FIX (Mismatch 3): sends expires_at (ISO 8601 timestamp string) instead
+        of timeout_s (raw integer). The frontend WsMsgScanResumePrompt.data
+        defines expires_at: string — a raw number is unreadable as a Date.
+        """
+        window_s = settings.MANUAL_VS_SCAN_RESUME_WINDOW_S
+        expires_at_iso = (
+            datetime.now(timezone.utc) + timedelta(seconds=window_s)
+        ).isoformat()
+
         try:
             from api.websocket import ws_registry
             ws_registry.broadcast_from_thread(
@@ -592,7 +603,8 @@ class ScanEngine:
                         "last_completed_col": last_col,
                         "grid_rows": grid_rows,
                         "grid_cols": grid_cols,
-                        "timeout_s": settings.MANUAL_VS_SCAN_RESUME_WINDOW_S,
+                        # FIX (Mismatch 3): ISO string, not a raw seconds integer
+                        "expires_at": expires_at_iso,
                         "message": (
                             "Scan paused due to manual command. "
                             "Resume from last cell or restart from beginning?"
@@ -605,7 +617,7 @@ class ScanEngine:
 
         self._cancel_resume_timer(rack_id)
         timer = threading.Timer(
-            settings.MANUAL_VS_SCAN_RESUME_WINDOW_S,
+            window_s,
             self._on_resume_window_expired,
             args=(rack_id,),
         )

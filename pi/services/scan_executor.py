@@ -254,9 +254,8 @@ class ScanExecutor:
 
                 # ── Cell sequence ─────────────────────────────────────
                 ok = self._do_cell(rack_id, row, col, progress)
-                if not ok:
-                    progress.cells_failed += 1
-                    # Continue to next cell even on failure (best-effort scan)
+                # Note: _do_cell updates progress.cells_completed / cells_failed
+                # internally, so we do NOT double-count here.
 
                 # ── Post-cell SCAN_STOP check (Section 5.5 / 4.8) ────
                 if self._stop_requested.is_set() and not self._abort_requested.is_set():
@@ -283,7 +282,6 @@ class ScanExecutor:
         if scan_aborted:
             self._handle_abort(progress)
         elif scan_paused:
-            progress.last_completed_row = progress.last_completed_row
             self._publish_scan_status(progress, "paused")
         else:
             self._publish_scan_status(progress, "complete")
@@ -301,6 +299,7 @@ class ScanExecutor:
         Execute one scan cell:
           M700 Rrow Ccol → M114 → M710 → capture → M711 → scan_progress
         Returns True on success, False if any step failed.
+        Updates progress.cells_completed / cells_failed exactly once.
         """
         logger.debug("ScanExecutor: cell row=%d col=%d", row, col)
 
@@ -309,11 +308,14 @@ class ScanExecutor:
         resp = self._serial_cmd(move_cmd, timeout=_M114_WAIT_S)
         if resp is None:
             logger.warning("ScanExecutor: M700 R%d C%d timed out", row, col)
+            progress.cells_failed += 1
+            progress.last_completed_row = row
+            progress.last_completed_col = col
+            self._publish_scan_progress(progress, row, col, False)
             return False
 
         # M114 position read (confirms arrival)
-        m114_resp = self._serial_cmd("M114", timeout=_M114_WAIT_S)
-        # (server-side position_monitor will parse this when the Pi relays it)
+        self._serial_cmd("M114", timeout=_M114_WAIT_S)
 
         # Camera in (M710)
         self._serial_cmd("M710", timeout=10.0)
@@ -329,7 +331,7 @@ class ScanExecutor:
         # Camera out (M711)
         self._serial_cmd("M711", timeout=10.0)
 
-        # Update progress
+        # Update progress counters exactly once per cell
         if capture_ok:
             progress.cells_completed += 1
         else:
@@ -338,7 +340,7 @@ class ScanExecutor:
         progress.last_completed_row = row
         progress.last_completed_col = col
 
-        # Publish scan_progress
+        # Publish scan_progress — uses cell_row/cell_col to match frontend type
         self._publish_scan_progress(progress, row, col, capture_ok)
 
         return capture_ok
@@ -390,6 +392,10 @@ class ScanExecutor:
         Publish SCAN_KEEPALIVE on the response topic every
         scan_lock_keepalive_interval_s seconds so the server resets the scan
         lock expiry (Section 4.3 / 5.5).
+
+        FIX (Mismatch 8): The server now handles SCAN_KEEPALIVE in
+        _on_response_message and calls extend_lock() to prevent the scan
+        lock from expiring mid-scan.
         """
         interval = settings.scan_lock_keepalive_interval_s
         logger.debug("ScanExecutor: keepalive loop started (interval=%.0fs)", interval)
@@ -417,13 +423,19 @@ class ScanExecutor:
         col: int,
         cell_ok: bool,
     ) -> None:
-        """Publish one scan_progress message (QoS 0 — best effort)."""
+        """
+        Publish one scan_progress message (QoS 0 — best effort).
+
+        FIX (Mismatch 1): Use cell_row/cell_col keys (not row/col) so the
+        server's on_scan_progress handler and the frontend WsMsgScanCellComplete
+        type both read the correct field names.
+        """
         try:
             mqtt_client.publish_scan_progress({
                 "scan_session_id": progress.scan_session_id,
                 "rack_id": progress.rack_id,
-                "row": row,
-                "col": col,
+                "cell_row": row,   # was: "row" — renamed to match frontend type
+                "cell_col": col,   # was: "col" — renamed to match frontend type
                 "cell_ok": cell_ok,
                 "cells_completed": progress.cells_completed,
                 "cells_failed": progress.cells_failed,

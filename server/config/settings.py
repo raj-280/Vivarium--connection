@@ -159,6 +159,14 @@ class Settings(BaseSettings):
         default=120,
         description="Capture lock lifetime; reset on CAPTURE_STARTED keepalive",
     )
+    SCAN_LOCK_TIMEOUT_S: int = Field(
+        default=90,
+        description=(
+            "Scan lock lifetime; reset on each SCAN_KEEPALIVE from the Pi "
+            "(sent every scan_lock_keepalive_interval_s, default 30s) so a "
+            "healthy 30s cadence always renews well before this expires."
+        ),
+    )
     MANUAL_VS_SCAN_RESUME_WINDOW_S: int = Field(
         default=300,
         description=(

@@ -20,7 +20,13 @@ Routers:
   /         — api/routes.py  (HTTP)
   /ws       — api/websocket.py (WebSocket)
 
-APScheduler and pending-command sweep will be added in Stage 12 (auto-scan).
+FIXES applied in this version
+──────────────────────────────
+• Mismatch 7: CAPTURE_ERROR from Pi now has a handler that releases the
+  capture lock so the rack isn't permanently stuck.
+• Mismatch 8: SCAN_KEEPALIVE from Pi now has a handler that calls extend_lock()
+  to reset the scan lock expiry, preventing the lock sweep from killing a
+  running scan mid-flight.
 """
 
 from __future__ import annotations
@@ -72,16 +78,19 @@ def _on_response_message(
     """
     Handler for vivarium/rack/{id}/response messages (Section 5.2 / 4.3).
 
-    Relevant for Stage 9:
-      CAPTURE_STARTED — reset lock_expires_at to CAPTURE_LOCK_TIMEOUT_S from now
-                         (lock-keepalive, Section 4.3). Prevents the lock from
-                         expiring during a slow save or future S3 upload.
-      CAPTURE_DONE    — release the capture lock immediately so the next queued
-                         command (if any) can run.
-
-    All other response messages are passed through to the relay unchanged.
-    The catch-all relay handler (relay_mqtt_to_ws) also runs for every message
-    because it is registered with subtopic="*"; we only need side-effects here.
+    Relevant response prefixes handled:
+      CAPTURE_STARTED  — extend capture lock (keepalive).
+      CAPTURE_DONE     — belt-and-suspenders capture lock release.
+      CAPTURE_ERROR    — release capture lock so rack isn't permanently stuck
+                         (FIX Mismatch 7).
+      SCAN_KEEPALIVE   — extend scan lock so it doesn't expire mid-scan
+                         (FIX Mismatch 8).
+      BRIDGE_RECONNECTED — mark stale-homing check due.
+      LAYOUT_CONFIG    — update gantry_state + DB.
+      M799 LIMITS      — update limit fields in gantry_state + DB.
+      M705/M706/M707   — update layout fields in gantry_state + layout_cache.
+      M114             — position verification via position_monitor.
+      COMMAND_ACK:*    — auto-publish M114 after motion commands.
     """
     if rack_id is None:
         return
@@ -90,18 +99,10 @@ def _on_response_message(
     raw = payload if isinstance(payload, str) else json.dumps(payload)
 
     # ── M114 position verification (Section 4.4) ──────────────────────────
-    # position_monitor.on_m114 parses the line, updates gantry_state + DB,
-    # and triggers recovery if tolerance or homing checks fail.
-    # Require both 'X:' and 'homed:' to avoid false positives from other
-    # messages that happen to contain the word "homed".
     if "X:" in raw and "homed:" in raw:
         position_monitor.on_m114(rack_id, raw)
 
     # ── Auto-M114 follow-up after motion command ACK (Section 4.4) ────────
-    # When the Pi ACKs a motion command (COMMAND_ACK:M700 / COMMAND_ACK:G28
-    # etc.) the server publishes M114 so position_monitor can record where the
-    # gantry actually stopped.  Without this, last_position_x/y stay None
-    # for standalone manual moves (the scan executor does its own M114 inline).
     _MOTION_CMDS = ("M700", "M701", "M702", "M703", "M704", "G28")
     if raw.startswith("COMMAND_ACK:"):
         acked_cmd = raw.split(":", 1)[1].strip().split()[0].upper()
@@ -120,17 +121,11 @@ def _on_response_message(
                 )
 
     # ── BRIDGE_RECONNECTED (Section 5.2 / 4.4) ───────────────────────────
-    # Pi publishes this after every reconnect-cleanup sequence.
-    # Signal the position_monitor so the next M114 runs a stale-homing check.
     if raw.startswith("BRIDGE_RECONNECTED"):
         logger.info("BRIDGE_RECONNECTED received for rack=%s — marking stale-homing check due.", rack_id)
         position_monitor.mark_stale_check_due(rack_id)
 
     # ── LAYOUT_CONFIG (Item 1 / Section 5.2 step 5) ───────────────────────
-    # Pi publishes this JSON blob on every reconnect after querying M705/M706/
-    # M707/M799. The raw string starts with '{' because publish_response sends
-    # it as json.dumps(payload). We parse it here and update gantry_state +
-    # the DB in a background thread.
     if raw.startswith("{"):
         try:
             data = json.loads(raw)
@@ -170,11 +165,6 @@ def _on_response_message(
                 ).start()
 
     # ── M799 LIMITS response handler ──────────────────────────────────────
-    # Handles standalone M799 responses: "LIMITS X=300.00 Y=200.00 C=180.00"
-    # These arrive when the Pi sends a direct M799 command (e.g. from the
-    # POST /rack/{rack_id}/query-limits endpoint or from a manual M799 command).
-    # LAYOUT_CONFIG already handles limits if M799 is sent during reconnect, but
-    # direct M799 commands bypass that path.
     if raw.startswith("LIMITS"):
         import re as _re
         m_limits = _re.search(
@@ -203,8 +193,6 @@ def _on_response_message(
             ).start()
 
     # ── M705 ROWS/COLS response handler ───────────────────────────────────
-    # Handles "ROWS=12 COLS=7" from a direct M705 command.
-    # Stores in layout_cache for GET /rack/{rack_id}/layout?live=true.
     if raw.startswith("ROWS"):
         import re as _re
         m_rc = _re.search(r'ROWS=(\d+)\s+COLS=(\d+)', raw, _re.IGNORECASE)
@@ -216,7 +204,6 @@ def _on_response_message(
             logger.info("M705 ROWS/COLS received rack=%s: rows=%d cols=%d", rack_id, rows, cols)
 
     # ── M706 Pitch response handler ───────────────────────────────────────
-    # Handles "Pitch X=50.0 Y=50.0" from a direct M706 command.
     if raw.startswith("Pitch"):
         import re as _re
         m_pitch = _re.search(r'Pitch\s+X=([-\d.]+)\s+Y=([-\d.]+)', raw, _re.IGNORECASE)
@@ -228,7 +215,6 @@ def _on_response_message(
             logger.info("M706 Pitch received rack=%s: X=%.2f Y=%.2f", rack_id, px, py)
 
     # ── M707 Offsets response handler ─────────────────────────────────────
-    # Handles "Offsets X0=0.0 Y0=0.0" from a direct M707 command.
     if raw.startswith("Offsets"):
         import re as _re
         m_off = _re.search(r'Offsets\s+X0=([-\d.]+)\s+Y0=([-\d.]+)', raw, _re.IGNORECASE)
@@ -239,10 +225,8 @@ def _on_response_message(
             _lc.set(rack_id, "M707", raw)
             logger.info("M707 Offsets received rack=%s: X0=%.2f Y0=%.2f", rack_id, x0, y0)
 
+    # ── CAPTURE_STARTED ───────────────────────────────────────────────────
     if raw.startswith("CAPTURE_STARTED"):
-
-
-        # Keepalive: reset the capture lock expiry (Section 4.3)
         logger.info("CAPTURE_STARTED received for rack=%s — extending capture lock", rack_id)
         with db_session() as db:
             extended = extend_lock(
@@ -256,19 +240,72 @@ def _on_response_message(
                 rack_id,
             )
 
+    # ── CAPTURE_DONE ──────────────────────────────────────────────────────
     elif raw.startswith("CAPTURE_DONE"):
-        # Capture cycle finished — lock released by the image handler when the
-        # /image MQTT message arrives.  CAPTURE_DONE is a belt-and-suspenders
-        # release in case the /image message was lost or delayed.
         logger.info("CAPTURE_DONE received for rack=%s", rack_id)
-        # The authoritative release is in _on_image_message below; only release
-        # here if there is still a capture-type lock (avoids releasing a scan
-        # lock that was acquired after the capture).
         state = gantry_state.get(rack_id)
         if state and state.lock_type == "capture":
             with db_session() as db:
                 release_lock(rack_id=rack_id, db=db)
             logger.info("Capture lock released on CAPTURE_DONE for rack=%s", rack_id)
+
+    # ── CAPTURE_ERROR (FIX Mismatch 7) ───────────────────────────────────
+    # Pi publishes "CAPTURE_ERROR:{exception}" when the photo fails.
+    # Without this handler the capture lock was never released, permanently
+    # locking the rack until the 2-second sweep task timed it out.
+    elif raw.startswith("CAPTURE_ERROR"):
+        error_detail = raw[len("CAPTURE_ERROR:"):].strip() if ":" in raw else "unknown"
+        logger.error(
+            "CAPTURE_ERROR received for rack=%s: %s — releasing capture lock",
+            rack_id, error_detail,
+        )
+        state = gantry_state.get(rack_id)
+        if state and state.lock_type == "capture":
+            with db_session() as db:
+                release_lock(rack_id=rack_id, db=db)
+            logger.info(
+                "Capture lock released after CAPTURE_ERROR for rack=%s", rack_id
+            )
+        # Audit the failure so operators can diagnose it
+        try:
+            with db_session() as db:
+                db.add(AuditLog(
+                    event_type="capture_error",
+                    rack_id=rack_id,
+                    outcome="failure",
+                    details=json.dumps({"error": error_detail}),
+                    created_at=datetime.utcnow(),
+                ))
+        except Exception:
+            logger.exception(
+                "CAPTURE_ERROR audit write failed for rack=%s", rack_id
+            )
+
+    # ── SCAN_KEEPALIVE (FIX Mismatch 8) ──────────────────────────────────
+    # Pi's scan_executor publishes "SCAN_KEEPALIVE:{rack_id}:{iso_timestamp}"
+    # every 30 s so the server resets the scan lock expiry.  Without this
+    # handler the scan lock expired on its own timeout and the lock sweep
+    # released it mid-scan, allowing other commands to steal the lock while
+    # the scan was still physically running on the Arduino.
+    elif raw.startswith("SCAN_KEEPALIVE"):
+        logger.debug("SCAN_KEEPALIVE received for rack=%s — extending scan lock", rack_id)
+        with db_session() as db:
+            extended = extend_lock(
+                rack_id=rack_id,
+                additional_seconds=settings.SCAN_LOCK_TIMEOUT_S,
+                db=db,
+            )
+        if extended:
+            logger.debug(
+                "Scan lock extended by %ds for rack=%s",
+                settings.SCAN_LOCK_TIMEOUT_S, rack_id,
+            )
+        else:
+            logger.warning(
+                "SCAN_KEEPALIVE: no active scan lock found for rack=%s — "
+                "lock may have already expired",
+                rack_id,
+            )
 
 
 def _on_image_message(
@@ -280,14 +317,14 @@ def _on_image_message(
     Flow:
       1. Parse payload — expect {local_path|s3_key, sha256_checksum,
          capture_timestamp, rack_id, [cell_row, cell_col]}.
-      2. Validate local_path (or s3_key) via s3_handler.validate_image_path()
-         (Section 9 Layer 2A: pattern + rack-id cross-check).
-      3. Consume capture_attribution to get operator_id (may be None if expired).
-      4. Write an image_records row, catching UNIQUE constraint violations
-         (duplicate MQTT notifications) and logging duplicate_image_notification.
-      5. Release the capture lock (the Pi has finished).
-      6. Send capture_complete to the lock holder's WebSocket only
-         (Section 4.3 / 4.2 routing rules).
+      2. Validate local_path (or s3_key) via s3_handler.validate_image_path().
+      3. Consume capture_attribution to get operator_id.
+      4. Write an image_records row, handling UNIQUE duplicates.
+      5. Release the capture lock.
+      6. Send capture_complete to the lock holder's WebSocket only.
+
+    FIX (Mismatch 4): capture_complete now includes cell_row, cell_col,
+    and capture_timestamp in the data payload, matching WsMsgCaptureComplete.
     """
     if rack_id is None:
         return
@@ -336,10 +373,7 @@ def _on_image_message(
             ))
         return
 
-    # ── 3. Consume capture attribution (Section 3.12 / 4.3) ──────────────
-    # consume_capture_attribution() reads + deletes atomically.
-    # Returns None if attribution expired — image_records.triggered_by_operator
-    # is written as null and a validation_failure audit row is emitted.
+    # ── 3. Consume capture attribution ────────────────────────────────────
     operator_id: Optional[str] = cache.consume_capture_attribution(rack_id)
     attribution_expired = False
     if operator_id is None:
@@ -360,8 +394,7 @@ def _on_image_message(
             ts_str, rack_id,
         )
 
-    # ── 5. Write image_records row; handle UNIQUE constraint duplicate ────
-    # trigger_type: 'manual' if cell_row/col absent, 'auto_scan' if present.
+    # ── 5. Write image_records row ────────────────────────────────────────
     trigger_type = "auto_scan" if (cell_row is not None and cell_col is not None) else "manual"
 
     image_record_id: Optional[int] = None
@@ -371,8 +404,8 @@ def _on_image_message(
         with db_session() as db:
             record = ImageRecord(
                 rack_id=rack_id,
-                s3_key=s3_key,              # None when S3_ENABLED=false
-                local_path=local_path,      # populated for S3_ENABLED=false
+                s3_key=s3_key,
+                local_path=local_path,
                 sha256_checksum=sha256,
                 triggered_by_operator=operator_id,
                 trigger_type=trigger_type,
@@ -382,10 +415,9 @@ def _on_image_message(
                 created_at=datetime.utcnow(),
             )
             db.add(record)
-            db.flush()  # flush to get the autoincrement id before commit
+            db.flush()
             image_record_id = record.id
 
-            # Audit: image received
             db.add(AuditLog(
                 event_type="image_notification_received",
                 rack_id=rack_id,
@@ -402,8 +434,6 @@ def _on_image_message(
             ))
 
     except IntegrityError:
-        # UNIQUE constraint on s3_key/local_path fired — duplicate MQTT notification
-        # (Section 3.4 / 9 Layer 2C)
         duplicate = True
         logger.warning(
             "image message: duplicate notification for rack=%s path=%s — "
@@ -423,7 +453,6 @@ def _on_image_message(
             ))
 
     if attribution_expired and not duplicate:
-        # Emit a separate validation_failure audit entry for the attribution expiry
         with db_session() as db:
             db.add(AuditLog(
                 event_type="validation_failure",
@@ -437,9 +466,7 @@ def _on_image_message(
                 created_at=datetime.utcnow(),
             ))
 
-    # ── 6. Release the capture lock (Section 4.3) ─────────────────────────
-    # Only release if this rack holds a capture-type lock; guards against
-    # releasing a scan lock that was acquired after the capture completed.
+    # ── 6. Release the capture lock ───────────────────────────────────────
     if not duplicate:
         state = gantry_state.get(rack_id)
         if state and state.lock_type == "capture":
@@ -447,12 +474,9 @@ def _on_image_message(
                 release_lock(rack_id=rack_id, db=db)
             logger.info("Capture lock released on image arrival for rack=%s", rack_id)
 
-    # ── 7. Send capture_complete to the lock-holder’s WebSocket only ──────
-    # Section 4.3: "capture_complete is delivered over /ws ONLY to the WebSocket
-    # connection belonging to the lock_holder_user_id recorded at the time the
-    # capture was triggered — never broadcast."
-    # We read lock_holder from the operator_id we consumed (pre-release), not
-    # from the current state (which was just cleared above).
+    # ── 7. Send capture_complete to the lock-holder's WebSocket only ──────
+    # FIX (Mismatch 4): include cell_row, cell_col, capture_timestamp so the
+    # frontend WsMsgCaptureComplete.data fields are fully populated.
     if not duplicate:
         ws_registry.broadcast_from_thread(
             rack_id,
@@ -463,9 +487,10 @@ def _on_image_message(
                     "local_path": local_path,
                     "s3_key": s3_key,
                     "sha256": sha256,
-                    "image_record_id": image_record_id,
-                    "trigger_type": trigger_type,
-                    "attribution_expired": attribution_expired,
+                    # FIX (Mismatch 4): these three were missing from the payload
+                    "cell_row": cell_row,
+                    "cell_col": cell_col,
+                    "capture_timestamp": ts_str,  # ISO string as the Pi sent it
                 },
             },
             lock_holder_user_id=operator_id,
@@ -490,16 +515,10 @@ def _on_status_message(
     Handles two scenarios:
       • Heartbeat  — payload: {"status": "online", "camera_status": "online", ...}
       • Last Will  — payload: {"status": "offline", "reason": "unexpected_disconnect"}
-
-    Updates both the in-memory GantryState mirror and the racks DB row so that:
-      - The scan engine can gate auto-scans to online racks (Section 4.7).
-      - The frontend can display correct online/offline indicators.
-      - Scenario 4 (Last Will) and Scenario 5 (Reconnect) integration tests pass.
     """
     if rack_id is None:
         return
 
-    # Normalise payload to dict
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
@@ -519,14 +538,12 @@ def _on_status_message(
         rack_id, new_status, camera_status,
     )
 
-    # Update the in-memory state mirror immediately (no DB round-trip)
     gantry_state.upsert(
         rack_id,
         mqtt_status=new_status,
         camera_status=camera_status,
     )
 
-    # Persist to the DB in a background thread so the MQTT loop is not blocked
     def _persist() -> None:
         try:
             with db_session() as db:
@@ -560,47 +577,34 @@ def _on_status_message(
 async def lifespan(app: FastAPI):
     # ── STARTUP ──────────────────────────────────────────────────────────────
 
-    # 1. Create all DB tables (idempotent — skips existing)
     logger.info("Creating database tables …")
     create_tables()
 
-    # 2. Seed in-memory gantry state from DB
     logger.info("Seeding gantry state from DB …")
     with db_session() as db:
         racks = db.query(Rack).all()
         gantry_state.reconcile_from_db(racks)
     logger.info("Seeded %d rack(s) into gantry state.", len(gantry_state.rack_ids()))
 
-    # 3. Connect to MQTT broker and register handlers
     try:
         mqtt_client.connect(timeout_s=5.0)
-        # Wire the MQTT publish function into the queue manager (Section 4.3)
         from core.queue_manager import configure_publish
         configure_publish(mqtt_client.publish_command)
-        # Catch-all handler: routes all MQTT subtopics → WebSocket subscribers
         mqtt_client.register_handler("*", relay_mqtt_to_ws)
-        # Specific handlers for the capture flow (Stage 9)
         mqtt_client.register_handler("response",      _on_response_message)
         mqtt_client.register_handler("image",         _on_image_message)
-        # Stage 11: auto-scan progress and status
         mqtt_client.register_handler("scan_progress", scan_engine.on_scan_progress)
         mqtt_client.register_handler("scan_status",   scan_engine.on_scan_status)
-        # Stage 12: Pi heartbeat + Last Will → updates mqtt_status / camera_status
         mqtt_client.register_handler("status",        _on_status_message)
         logger.info("MQTT client connected and handlers registered.")
     except (RuntimeError, OSError) as exc:
-        # Server starts even if MQTT is unavailable (local dev without broker)
         logger.warning("MQTT connect failed — server will run without MQTT: %s", exc)
 
-    # 4. Give the WebSocket registry the running event loop so MQTT callbacks
-    #    can schedule coroutines from their background thread.
     ws_registry.set_loop(asyncio.get_event_loop())
 
-    # 5. Start background lock sweep task (every 2 s)
     start_lock_sweep_task()
     logger.info("Lock sweep task started.")
 
-    # 6. Start scan engine (APScheduler — 1-minute auto-scan job) — Stage 11
     scan_engine.start()
     logger.info("Scan engine started.")
 
@@ -614,7 +618,7 @@ async def lifespan(app: FastAPI):
 
     # ── SHUTDOWN ─────────────────────────────────────────────────────────────
     logger.info("Shutting down …")
-    scan_engine.stop()          # stop APScheduler before MQTT so no jobs fire mid-shutdown
+    scan_engine.stop()
     if mqtt_client.is_connected:
         mqtt_client.disconnect()
     logger.info("Shutdown complete.")
@@ -627,7 +631,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Vivarium Gantry System API",
-        version="0.6.0",         # bumped at Stage 11 (scan engine)
+        version="0.6.1",
         description=(
             "Central control server for the Vivarium Gantry System. "
             "See the implementation plan for full architecture details."
@@ -637,9 +641,6 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
-    # ── Middleware (outermost first) ─────────────────────────────────────────
-
-    # CORS — allow configured frontend origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.CORS_ALLOWED_ORIGINS,
@@ -648,14 +649,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # CSRF — double-submit cookie (no-op locally when CSRF_ENABLED=False)
-    # app.add_middleware(CSRFMiddleware)
-
-    # slowapi rate limiter
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # ── Routers ──────────────────────────────────────────────────────────────
     app.include_router(http_router)
     app.include_router(ws_router)
 

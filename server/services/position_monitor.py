@@ -34,6 +34,10 @@ Expected format from the Arduino (Section 6):
     "X:12.50 Y:24.00 C:0.00 homed:X=Y Y=Y C=N"
 Position values are the axis coordinates in mm.
 Homed flags: Y = homed, N = not homed.
+
+FIX (Mismatch 2): All alert WebSocket messages now use the correct envelope:
+    { type: "alert", rack_id: "...", data: { level: "...", code: "...", message: "..." } }
+matching frontend WsMsgAlert exactly.
 """
 
 from __future__ import annotations
@@ -63,6 +67,26 @@ _M114_RE = re.compile(
     r".*?homed:X=(?P<hx>[YN])\s*Y=(?P<hy>[YN])\s*C=(?P<hc>[YN])",
     re.IGNORECASE,
 )
+
+
+def _alert_msg(rack_id: str, level: str, code: str, message: str) -> dict:
+    """
+    Build a correctly-shaped WsMsgAlert envelope.
+
+    FIX (Mismatch 2): The old code sent flat top-level fields
+    (severity=, detail=). The frontend type WsMsgAlert expects:
+        { type: "alert", rack_id?: str, data: { level, code, message } }
+    All alert broadcasts in this module now call this helper.
+    """
+    return {
+        "type": "alert",
+        "rack_id": rack_id,
+        "data": {
+            "level": level,    # was: "severity" — renamed to match WsMsgAlert.data.level
+            "code": code,
+            "message": message,  # was: "detail" — renamed to match WsMsgAlert.data.message
+        },
+    }
 
 
 # ── Parsed M114 result ────────────────────────────────────────────────────────
@@ -164,8 +188,6 @@ class PositionMonitor:
                 rack_id,
                 result.homed_x, result.homed_y, result.homed_c,
             )
-            # Note: the scan_engine checks all_homed before each cell;
-            # for manual commands, command_handler reads gantry_state.
 
         # ── Check 2: Tolerance check ──────────────────────────────────────
         with self._lock:
@@ -309,7 +331,6 @@ class PositionMonitor:
         target_y: Optional[float],
     ) -> None:
         """Compare reported position to commanded target; start recovery on failure."""
-        # Fetch per-rack tolerance (fall back to global settings)
         tol_x = settings.POSITION_TOLERANCE_X_MM
         tol_y = settings.POSITION_TOLERANCE_Y_MM
         try:
@@ -337,8 +358,6 @@ class PositionMonitor:
                 err_x, err_y,
                 tol_x, tol_y,
             )
-            # Clear the target so we don't keep re-triggering recovery on
-            # subsequent M114s during the re-home sequence.
             with self._lock:
                 self._commanded_targets.pop(r.rack_id, None)
 
@@ -403,19 +422,19 @@ class PositionMonitor:
 
         try:
             from api.websocket import ws_registry
+            # FIX (Mismatch 2): wrapped in data:{level, code, message}
             ws_registry.broadcast_from_thread(
                 r.rack_id,
-                {
-                    "type": "alert",
-                    "rack_id": r.rack_id,
-                    "severity": "warning",
-                    "code": "stale_homing",
-                    "detail": (
+                _alert_msg(
+                    rack_id=r.rack_id,
+                    level="warning",
+                    code="stale_homing",
+                    message=(
                         f"Gantry not homed recently "
                         f"(last homed: {last_homed or 'never'}). "
                         "Please run G28 before issuing motion commands."
                     ),
-                },
+                ),
             )
         except Exception:
             logger.exception("Failed to send stale_homing alert for rack=%s", r.rack_id)
@@ -464,19 +483,19 @@ class PositionMonitor:
 
         try:
             from api.websocket import ws_registry
+            # FIX (Mismatch 2): wrapped in data:{level, code, message}
             ws_registry.broadcast_from_thread(
                 rack_id,
-                {
-                    "type": "alert",
-                    "rack_id": rack_id,
-                    "severity": "warning",
-                    "code": "re_homing",
-                    "detail": (
+                _alert_msg(
+                    rack_id=rack_id,
+                    level="warning",
+                    code="re_homing",
+                    message=(
                         f"Position error detected ({reason}). "
                         "Automatic re-home initiated. "
                         "Gantry status: re-homing."
                     ),
-                },
+                ),
             )
         except Exception:
             logger.exception(
@@ -549,19 +568,19 @@ class PositionMonitor:
 
         try:
             from api.websocket import ws_registry
+            # FIX (Mismatch 2): wrapped in data:{level, code, message}
             ws_registry.broadcast_from_thread(
                 rack_id,
-                {
-                    "type": "alert",
-                    "rack_id": rack_id,
-                    "severity": "critical",
-                    "code": "maintenance_required",
-                    "detail": (
+                _alert_msg(
+                    rack_id=rack_id,
+                    level="error",
+                    code="maintenance_required",
+                    message=(
                         "Position error recurred after re-home. "
                         "Rack marked maintenance_required. "
                         "Auto-scan disabled. Admin intervention required."
                     ),
-                },
+                ),
             )
         except Exception:
             logger.exception(

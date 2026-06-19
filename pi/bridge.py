@@ -24,8 +24,10 @@ Responsibilities (Stages 7 + 9 scope — Section 13.7 / 13.9):
        in Stage 7 — position_monitor equivalent on the Pi side is informational)
     3. /tmp sweep — delete any leftover rack-*-*.jpg files
     4. Publish BRIDGE_RECONNECTED on the response topic
-    5. Send M705/M706/M707/M799, parse all four responses, publish LAYOUT_CONFIG
-       JSON — the server updates gantry_state + DB from this one clean payload.
+    5. Send M705/M706/M707, parse all three responses, publish LAYOUT_CONFIG
+       JSON, then derive and publish LIMITS from grid geometry (M799 does
+       not exist in firmware) — the server updates gantry_state + DB from
+       these two payloads.
 
 Run:
     python -m pi.bridge
@@ -194,7 +196,7 @@ class Bridge:
           2. Homed-flag verify
           3. /tmp sweep (delete leftover rack-*-*.jpg)
           4. Publish BRIDGE_RECONNECTED
-          5. Query M705/M706/M707/M799, publish LAYOUT_CONFIG JSON
+          5. Query M705/M706/M707, publish LAYOUT_CONFIG JSON, derive+publish LIMITS
         """
         which = "initial connect" if not self._first_connect_done else "reconnect"
         logger.info("Running reconnect-cleanup sequence (%s)…", which)
@@ -255,7 +257,12 @@ class Bridge:
            rows_line   = self.serial.send_command("M705")
            pitch_line  = self.serial.send_command("M706")
            offset_line = self.serial.send_command("M707")
-           # M799 removed — not implemented in firmware
+           # M799 removed — not implemented in firmware. Machine limits are
+           # derived locally from grid geometry instead and published
+           # separately as a LIMITS line (see _publish_limits below) so the
+           # server's existing LIMITS handler in main.py actually receives
+           # something — without this, gantry_state.limit_x/y/c_mm stay
+           # null forever (Mismatch 9).
        except Exception:
            logger.exception("_publish_layout_config: serial error — skipping LAYOUT_CONFIG.")
            return
@@ -311,8 +318,64 @@ class Bridge:
                payload.get("pitch_x_mm"), payload.get("pitch_y_mm"),
                payload.get("x0_offset_mm"), payload.get("y0_offset_mm"),
            )
+           # Derive and publish machine limits now that we have fresh
+           # grid/pitch/offset values to compute them from (FIX Mismatch 9).
+           self._publish_limits(payload)
        else:
            logger.warning("_publish_layout_config: no valid responses from Arduino — LAYOUT_CONFIG not published.")
+
+    def _publish_limits(self, layout: dict) -> None:
+        """
+        Publish a "LIMITS X=.. Y=.. C=.." response line (FIX Mismatch 9).
+
+        Firmware has no M799 command, so there is no way to query true
+        hardware travel limits from the Arduino. Instead we derive a
+        reasonable approximation from grid geometry — the same numbers the
+        operator already trusts for cell positioning:
+
+            limit_x_mm = x0_offset_mm + (grid_cols - 1) * pitch_x_mm
+            limit_y_mm = y0_offset_mm + (grid_rows - 1) * pitch_y_mm
+
+        This is the position of the far corner cell, i.e. the maximum X/Y
+        the gantry should ever need to travel to reach any cell in the
+        grid. C (rotation) has no grid-derived equivalent, so it is
+        published as 360.0 (one full revolution) — adjust here if your
+        hardware has a different rotational limit.
+
+        Without this, server's `_on_response_message` LIMITS handler in
+        main.py never fires, and gantry_state.limit_x_mm/y/c_mm (and the
+        matching DB columns) stay null forever, which is exactly Mismatch 9.
+        """
+        try:
+            grid_cols = layout.get("grid_cols")
+            grid_rows = layout.get("grid_rows")
+            pitch_x   = layout.get("pitch_x_mm")
+            pitch_y   = layout.get("pitch_y_mm")
+            x0        = layout.get("x0_offset_mm", 0.0)
+            y0        = layout.get("y0_offset_mm", 0.0)
+
+            if None in (grid_cols, grid_rows, pitch_x, pitch_y):
+                logger.warning(
+                    "_publish_limits: incomplete layout (cols=%s rows=%s "
+                    "pitch_x=%s pitch_y=%s) — skipping LIMITS publish.",
+                    grid_cols, grid_rows, pitch_x, pitch_y,
+                )
+                return
+
+            limit_x = x0 + (grid_cols - 1) * pitch_x
+            limit_y = y0 + (grid_rows - 1) * pitch_y
+            limit_c = 360.0  # full rotation — no grid-derived equivalent
+
+            mqtt_client.publish_response(
+                f"LIMITS X={limit_x:.2f} Y={limit_y:.2f} C={limit_c:.2f}"
+            )
+            logger.info(
+                "LIMITS published (derived from grid geometry): X=%.2f Y=%.2f C=%.2f",
+                limit_x, limit_y, limit_c,
+            )
+        except Exception:
+            logger.exception("_publish_limits: failed to derive/publish LIMITS.")
+
     @staticmethod
     def _parse_homed_flags(m114_response: Optional[str]) -> Optional[dict[str, bool]]:
         """

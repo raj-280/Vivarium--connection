@@ -28,22 +28,48 @@ def _resolve_conf_path() -> str:
       3. device.conf next to this settings.py file  (development fallback —
          works automatically when running from the repo root without any .env
          or system-level install, e.g. `python -m pi.bridge` in the repo dir)
+
+    If GANTRY_DEVICE_CONF is set but points at a file that doesn't exist
+    (e.g. a stale value left in the shell/IDE env from a previous Pi-style
+    test), we don't hard-fail here — we log a warning and fall through to
+    steps 2/3 instead of returning a path that will never resolve. This used
+    to be what bit local/dev runs: an override pointed at a missing
+    /etc/gantry/device.conf-style path and silently shadowed the perfectly
+    good pi/config/device.conf sitting right next to this file.
     """
+    local_conf = Path(__file__).parent / "device.conf"
+
     override = os.environ.get(ENV_OVERRIDE_VAR)
     if override:
-        return override
+        if Path(override).is_file():
+            logger.info("Using device.conf from %s=%s", ENV_OVERRIDE_VAR, override)
+            return override
+        logger.warning(
+            "%s=%s is set but no file exists at that path. "
+            "Falling back to default resolution instead of failing outright.",
+            ENV_OVERRIDE_VAR,
+            override,
+        )
 
     if Path(DEFAULT_DEVICE_CONF_PATH).is_file():
+        logger.info("Using device.conf from %s", DEFAULT_DEVICE_CONF_PATH)
         return DEFAULT_DEVICE_CONF_PATH
 
     # Development fallback: look for device.conf in the same directory as
     # this settings.py file (i.e. pi/config/device.conf).
-    local_conf = Path(__file__).parent / "device.conf"
     if local_conf.is_file():
+        logger.info("Using device.conf from local dev fallback %s", local_conf)
         return str(local_conf)
 
-    # No file found — return the default path anyway; Settings.__init__ will
-    # detect loaded_from_file=False and log a warning, then use _DEFAULTS.
+    # No file found anywhere — return the default path anyway;
+    # Settings.__init__ will detect loaded_from_file=False, log a clear
+    # warning naming every path that was tried, and fall back to _DEFAULTS.
+    logger.warning(
+        "No device.conf found. Tried: %s, %s, %s. Using built-in defaults.",
+        override or "(GANTRY_DEVICE_CONF not set)",
+        DEFAULT_DEVICE_CONF_PATH,
+        local_conf,
+    )
     return DEFAULT_DEVICE_CONF_PATH
 
 

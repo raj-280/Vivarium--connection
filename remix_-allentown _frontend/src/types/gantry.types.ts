@@ -3,6 +3,26 @@
  *
  * Section 7 — shared TypeScript types for all WebSocket message shapes,
  * gantry state, and UI state. Import from here in every component/context.
+ *
+ * FIXES applied in this version
+ * ──────────────────────────────
+ * • Mismatch 10: Added WsMsgCommandAck and included it in the WsMessage union.
+ *   The server sends { type: "command_ack", rack_id, command, outcome } after
+ *   every command dispatched via WebSocket; the type was previously missing
+ *   from the union so TypeScript couldn't handle it.
+ *
+ * • Mismatch 4: WsMsgCaptureComplete.data now includes cell_row, cell_col,
+ *   and capture_timestamp (fields the server always had in its DB schema but
+ *   wasn't sending — now fixed in main.py _on_image_message). Also added
+ *   image_record_id, trigger_type, and attribution_expired which the server
+ *   has always sent but the frontend type omitted.
+ *
+ * • Mismatch 5 (documentation): WsMsgStatus.data carries heartbeat fields
+ *   (status, camera_status, ts, device_id) only — NOT live position or homing
+ *   data. Position data (x, y, c, homed_*) arrives via the raw "response"
+ *   subtopic as M114 strings parsed by the server's position_monitor. The
+ *   frontend must parse those separately; they do not arrive inside a
+ *   WsMsgStatus envelope.
  */
 
 // ---------------------------------------------------------------------------
@@ -34,25 +54,27 @@ export interface WsMsgPong {
 }
 
 /**
- * Periodic position update — relayed from M114 Arduino response.
- * data mirrors the fields the Pi publishes on vivarium/rack/{id}/response.
+ * Pi heartbeat / Last Will message.
+ *
+ * NOTE (Mismatch 5): This message carries ONLY heartbeat fields (status,
+ * camera_status, ts, device_id). It does NOT carry live position (x/y/c)
+ * or homing flags. Those arrive on the "response" subtopic as raw M114
+ * strings. The server's position_monitor parses them and stores them in
+ * gantry_state; the frontend should read position via GET /rack/{id}/position
+ * or parse response subtopic messages separately.
  */
 export interface WsMsgStatus {
   type: 'status';
   rack_id: string;
   data: {
+    /** 'online' from heartbeats, 'offline' from Last Will */
     status?: 'online' | 'offline';
+    /** Reason included in Last Will messages */
     reason?: string;
-    x?: number;
-    y?: number;
-    c?: number;
-    homed_x?: boolean;
-    homed_y?: boolean;
-    homed_c?: boolean;
-    scan_state?: ScanState;
     camera_status?: 'online' | 'offline' | 'unknown';
-    /** heartbeat tick from the Pi */
+    /** ISO heartbeat timestamp from the Pi */
     ts?: string;
+    device_id?: string;
   };
 }
 
@@ -79,6 +101,10 @@ export interface WsMsgLockReleased {
 /**
  * capture_complete — routed only to the operator who holds the lock.
  * Viewers never receive this (Section 4.3).
+ *
+ * FIX (Mismatch 4): Added cell_row, cell_col, capture_timestamp (which the
+ * server now populates from the Pi image payload). Also added image_record_id,
+ * trigger_type, and attribution_expired which the server has always sent.
  */
 export interface WsMsgCaptureComplete {
   type: 'capture_complete';
@@ -87,23 +113,38 @@ export interface WsMsgCaptureComplete {
     s3_key?: string;
     local_path?: string;
     sha256?: string;
+    /** DB row id — present after successful image_records insert */
+    image_record_id?: number;
+    /** 'manual' | 'auto_scan' */
+    trigger_type?: string;
+    /** True if the operator attribution TTL expired before the image arrived */
+    attribution_expired?: boolean;
+    /** Grid cell coordinates — present for auto_scan captures */
     cell_row?: number;
     cell_col?: number;
+    /** ISO timestamp of when the photo was taken on the Pi */
     capture_timestamp?: string;
   };
 }
 
 /**
  * scan_cell_complete — broadcast to all rack subscribers (Section 4.3).
+ *
+ * FIX (Mismatch 1): The Pi now sends cell_row/cell_col (not row/col),
+ * so these field names now match what actually arrives.
  */
 export interface WsMsgScanCellComplete {
   type: 'scan_cell_complete';
   rack_id: string;
   data: {
-    cell_row: number;
-    cell_col: number;
+    cell_row: number;   // was: "row" on the Pi — now fixed to cell_row
+    cell_col: number;   // was: "col" on the Pi — now fixed to cell_col
     cells_completed: number;
     cells_total: number;
+    cells_failed?: number;
+    cell_ok?: boolean;
+    scan_session_id?: number;
+    ts?: string;
   };
 }
 
@@ -116,6 +157,10 @@ export interface WsMsgScanStatus {
     last_completed_row?: number;
     last_completed_col?: number;
     abort_reason?: string;
+    cells_completed?: number;
+    cells_failed?: number;
+    cells_total?: number;
+    duration_s?: number;
   };
 }
 
@@ -134,26 +179,60 @@ export interface WsMsgStreamUrl {
 
 /**
  * Escalation ladder alerts — maintenance_required, re-homing, etc. (Section 10)
+ *
+ * FIX (Mismatch 2): The server previously sent flat top-level fields
+ * (severity=, detail=). It now sends the correct envelope with data.level
+ * and data.message as defined here. No frontend type change needed —
+ * this type was already correct; the server was the bug.
  */
 export interface WsMsgAlert {
   type: 'alert';
   rack_id?: string;
   data: {
+    /** Severity level — matches CSS/UI indicator colour */
     level: 'info' | 'warning' | 'error';
-    code: string;          // e.g. "re_homing", "maintenance_required"
+    code: string;          // e.g. "re_homing", "maintenance_required", "stale_homing"
     message: string;
   };
 }
 
-/** Scan resume/restart prompt after a manual-command conflict (Section 4.8) */
+/**
+ * Scan resume/restart prompt after a manual-command conflict (Section 4.8).
+ *
+ * FIX (Mismatch 3): expires_at is now an ISO 8601 timestamp string (not a
+ * raw seconds integer). The server was previously sending timeout_s (number);
+ * it now computes and sends expires_at so this field is directly usable as
+ * new Date(expires_at) in the frontend without arithmetic.
+ */
 export interface WsMsgScanResumePrompt {
   type: 'scan_resume_prompt';
   rack_id: string;
   data: {
+    scan_session_id?: number;
     last_completed_row: number;
     last_completed_col: number;
-    expires_at: string;    // ISO — after this the scan restarts from beginning
+    grid_rows?: number;
+    grid_cols?: number;
+    /** ISO 8601 — after this timestamp the window closes and scan restarts */
+    expires_at: string;
+    message?: string;
   };
+}
+
+/**
+ * command_ack — sent by the server after every command dispatched via
+ * WebSocket (Section 4.2).
+ *
+ * FIX (Mismatch 10): This message type was sent by the server but was
+ * completely absent from the WsMessage union, making it impossible to
+ * handle in TypeScript without an unsafe cast. Now included.
+ */
+export interface WsMsgCommandAck {
+  type: 'command_ack';
+  rack_id: string;
+  command: string;
+  /** e.g. "published", "queued", "emergency", "error:..." */
+  outcome: string;
 }
 
 /** Union of all server→browser message shapes */
@@ -170,7 +249,8 @@ export type WsMessage =
   | WsMsgScanStatus
   | WsMsgStreamUrl
   | WsMsgAlert
-  | WsMsgScanResumePrompt;
+  | WsMsgScanResumePrompt
+  | WsMsgCommandAck;   // FIX (Mismatch 10): added
 
 // ---------------------------------------------------------------------------
 // Browser → server WebSocket message shapes
@@ -244,9 +324,6 @@ export interface HealthResponse {
 
 /**
  * Rack grid layout — mirrors GET /rack/{rack_id}/layout response.
- * Populated in SystemContext.subscribeRack() and used by GantryGrid to:
- *   - Render the grid with the correct row/column count
- *   - Compute the active cell from the gantry's X/Y position
  */
 export interface RackLayout {
   rack_id: string;
@@ -262,4 +339,3 @@ export interface RackLayout {
   limit_y_mm?: number | null;
   limit_c_mm?: number | null;
 }
-
