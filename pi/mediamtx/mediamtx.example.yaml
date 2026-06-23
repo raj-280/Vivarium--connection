@@ -7,13 +7,25 @@
 #
 #     pi/mediamtx/mediamtx.yaml   (mode 600, read by vivarium-camera.service)
 #
+# ── Version lock ──────────────────────────────────────────────────────────────
+# This template is written for a SPECIFIC MediaMTX release.  setup.sh reads
+# the marker below and aborts if it does not match MEDIAMTX_VERSION in setup.sh.
+# When upgrading MediaMTX:
+#   1. Check the MediaMTX changelog for YAML-breaking changes.
+#   2. Update this file to match the new schema.
+#   3. Bump the marker below to the new version.
+#   4. Bump MEDIAMTX_VERSION in setup.sh to the same value.
+#   5. Test on a real Pi before rolling out.
+#
+# mediamtx_version_compat: v1.9.3
+#
 # ── Placeholders ─────────────────────────────────────────────────────────────
 #   {{DEVICE_ID}}       — this Pi's device_id (e.g. rack-001)
 #   {{RTSP_PASSWORD}}   — issued by POST /provision, stored in device.conf
 #   {{MEDIAMTX_PORT}}   — from device.conf [streaming] mediamtx_port (default 8554)
 #
-# ── MediaMTX version compatibility ───────────────────────────────────────────
-# This config targets MediaMTX v1.x (v1.0.0+).
+# ── MediaMTX v1.9.3 compatibility notes ──────────────────────────────────────
+# This config targets MediaMTX v1.9.3 specifically.
 #   - "api: true" (bool) was valid in v0.x but BREAKS in v1.x where "api" is
 #     a struct. Use "api: yes" (bool synonym) or the struct form below.
 #     The safest cross-version form is the explicit struct shown below.
@@ -31,10 +43,11 @@ paths:
     source: rpiCamera
     sourceOnDemand: true     # open camera only while someone is watching
 
-    # Per-path authentication — only the server needs to pull this stream.
-    # [PROD ONLY] Change to a strong generated password (done by provisioner).
-    readUser: "{{DEVICE_ID}}"
-    readPass: "{{RTSP_PASSWORD}}"
+    # No readUser/readPass — the browser connects via WHEP directly on the LAN
+    # and cannot supply HTTP credentials. WebRTC/WHEP is LAN-only anyway;
+    # UFW on the Pi restricts port 8889 to the server subnet.
+    # RTSP (port 8554) is also LAN-only; UFW restricts it to the server IP
+    # so no RTSP auth is needed at the MediaMTX level either.
 
     # ── Camera Module 3 (autofocus hardware) ─────────────────────────────
     rpiCameraWidth: 1920

@@ -12,10 +12,15 @@ Flipping those two flags is the entirety of the S3 upgrade (Section 12).
 
 capture(row, col) flow (Section 5.4):
   1. Take a photo into /tmp/rack-{id}-{timestamp}.jpg (permissions 600).
-     • Real Pi:  subprocess call to `libcamera-still`.
-     • Local dev (GANTRY_MOCK_CAMERA=1 or libcamera-still not found):
+     • Real Pi:  subprocess call to `rpicam-still` (Raspberry Pi OS Bookworm+),
+       falling back to the legacy `libcamera-still` name on older images.
+     • Local dev (GANTRY_MOCK_CAMERA=1 explicitly set):
        write a synthetic placeholder JPEG so the rest of the flow is fully
        exercisable without hardware.
+     • Neither binary found AND GANTRY_MOCK_CAMERA not set: raise loudly.
+       (A missing binary on real hardware must never be silently treated
+       as "use the mock" — that previously caused real captures to be
+       silently replaced with a 1x1 placeholder JPEG.)
   2. Compute SHA-256 of the file.
   3. Publish CAPTURE_STARTED on the response topic
      (server resets the capture lock on receipt — Section 4.3).
@@ -56,13 +61,20 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# When set to any non-empty value, skip the real libcamera-still call and
+# When set to any non-empty value, skip the real camera binary call and
 # write a synthetic placeholder JPEG instead.  Never set on a real Pi.
 _MOCK_CAMERA_ENV = "GANTRY_MOCK_CAMERA"
 
-# Timeout for the libcamera-still subprocess (seconds).  config-driven if we
+# Timeout for the still-capture subprocess (seconds).  config-driven if we
 # ever add a capture_timeout_s key; hard-coded to 30s for now.
 _LIBCAMERA_TIMEOUT_S = 30
+
+# Candidate still-capture binaries, checked in order. `rpicam-still` is the
+# current name on Raspberry Pi OS Bookworm+ (including all Pi 5 images).
+# `libcamera-still` is the legacy pre-Bookworm name, kept as a fallback for
+# older images. Recent rpicam-apps releases removed the libcamera-* symlinks,
+# so checking only the old name silently breaks on current installs.
+_CAMERA_BINARY_CANDIDATES: tuple[str, ...] = ("rpicam-still", "libcamera-still")
 
 
 def _make_minimal_jpeg() -> bytes:
@@ -213,36 +225,60 @@ class CameraHandler:
         """
         Write a JPEG to tmp_path.
 
-        Real Pi:       calls libcamera-still (subprocess).
-        Local dev/CI:  writes a synthetic placeholder JPEG when
-                       GANTRY_MOCK_CAMERA is set or libcamera-still is absent.
-        """
-        use_mock = bool(os.environ.get(_MOCK_CAMERA_ENV)) or not self._libcamera_available()
+        Real Pi:       resolves rpicam-still / libcamera-still and calls it
+                       (subprocess).
+        Local dev/CI:  writes a synthetic placeholder JPEG ONLY when
+                       GANTRY_MOCK_CAMERA is explicitly set.
 
-        if use_mock:
-            logger.info("capture: using MOCK camera (no real hardware)")
+        IMPORTANT: a missing binary on real hardware is NOT treated as "use
+        the mock" — that silently masked real capture failures behind a fake
+        placeholder JPEG. If no camera tool is found and mock mode wasn't
+        explicitly requested, this raises so the caller publishes
+        CAPTURE_ERROR instead of a fake success.
+        """
+        explicit_mock = bool(os.environ.get(_MOCK_CAMERA_ENV))
+
+        if explicit_mock:
+            logger.info("capture: using MOCK camera (%s set)", _MOCK_CAMERA_ENV)
             self._write_mock_jpeg(tmp_path)
         else:
-            self._libcamera_still(tmp_path)
+            binary = self._resolve_camera_binary()
+            if binary is None:
+                raise RuntimeError(
+                    "No camera capture binary found on PATH (looked for: "
+                    f"{', '.join(_CAMERA_BINARY_CANDIDATES)}). If this Pi has "
+                    "no camera hardware attached, set "
+                    f"{_MOCK_CAMERA_ENV}=1 to use the mock camera explicitly."
+                )
+            self._run_camera_still(binary, tmp_path)
 
         # Secure the file: owner read/write only (Section 5.4 / 9 Layer 3)
         tmp_path.chmod(0o600)
 
     @staticmethod
-    def _libcamera_available() -> bool:
-        """Return True if libcamera-still is on PATH."""
-        return shutil.which("libcamera-still") is not None
+    def _resolve_camera_binary() -> Optional[str]:
+        """
+        Return the first available still-capture binary on PATH, preferring
+        the current `rpicam-still` name (Raspberry Pi OS Bookworm+, including
+        every Pi 5 image) and falling back to the legacy `libcamera-still`
+        name for older pre-Bookworm images. Returns None if neither is found.
+        """
+        for name in _CAMERA_BINARY_CANDIDATES:
+            if shutil.which(name) is not None:
+                return name
+        return None
 
     @staticmethod
-    def _libcamera_still(tmp_path: Path) -> None:
+    def _run_camera_still(binary: str, tmp_path: Path) -> None:
         """
-        Invoke libcamera-still to capture a single JPEG.
+        Invoke the resolved still-capture binary to capture a single JPEG.
+        `rpicam-still` and the legacy `libcamera-still` accept the same flags.
 
         The capture goes through /tmp (tmpfs on a real Pi so the SD card is
         never written — Section 5.4 / 9 Layer 3).
         """
         cmd = [
-            "libcamera-still",
+            binary,
             "--output", str(tmp_path),
             "--nopreview",
             "--timeout", "2000",   # 2 s viewfinder settle time
@@ -256,11 +292,11 @@ class CameraHandler:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"libcamera-still failed (rc={result.returncode}): "
+                f"{binary} failed (rc={result.returncode}): "
                 f"{result.stderr.decode(errors='replace')}"
             )
         if not tmp_path.exists():
-            raise RuntimeError(f"libcamera-still exited 0 but {tmp_path} was not created")
+            raise RuntimeError(f"{binary} exited 0 but {tmp_path} was not created")
 
     @staticmethod
     def _write_mock_jpeg(tmp_path: Path) -> None:

@@ -7,21 +7,24 @@
 #   sudo bash setup.sh
 #
 # What this script does (in order):
-#   1.  Print banner + check prerequisites
-#   2.  Prompt for server URL, provisioning secret, MQTT broker host
-#   3.  Assert mediamtx/mediamtx.example.yaml exists (provisioner needs it)
-#   4.  Install Python dependencies (pip3 install -r requirements.txt)
-#   5.  Download and install the MediaMTX binary
-#   6.  Write a temporary provisioner.env file with the credentials
-#   7.  Run provisioner.py  (writes /etc/vivarium/device.conf +
-#           mediamtx/mediamtx.yaml, then exits)
-#   8.  Verify mediamtx/mediamtx.yaml was written
-#   9.  Create capture directory /var/vivarium/{device_id}/captures
-#       (written to device.conf [capture] capture_dir by provisioner.py)
-#  10.  Delete provisioner.env (credentials no longer needed on disk)
-#  11.  Patch + install the three systemd service files
-#  12.  Enable + start all services
-#  13.  Print summary + log viewing hints
+#   1.   Print banner + check prerequisites
+#   1.5. Create Python virtual environment (venv) — ALL pip/python ops use it
+#   2.   Prompt for server URL, provisioning secret, MQTT broker host
+#   3.   Assert mediamtx/mediamtx.example.yaml exists AND its
+#            'mediamtx_version_compat:' marker matches MEDIAMTX_VERSION
+#   4.   Install Python dependencies into the venv
+#   5.   Download and install the MediaMTX binary (pinned MEDIAMTX_VERSION —
+#            direct URL, no GitHub "latest" API call)
+#   6.   Write a temporary provisioner.env file with the credentials
+#   7.   Run provisioner.py via venv Python (writes /etc/vivarium/device.conf +
+#            mediamtx/mediamtx.yaml, then exits)
+#   8.   Verify mediamtx/mediamtx.yaml was written
+#   9.   Create capture directory /var/vivarium/{device_id}/captures
+#        (written to device.conf [capture] capture_dir by provisioner.py)
+#  10.   Delete provisioner.env (credentials no longer needed on disk)
+#  11.   Patch + install the three systemd service files
+#  12.   Enable + start all services
+#  13.   Print summary + log viewing hints
 #
 # After this script completes, the Pi will:
 #   • Run provisioner.py automatically on every boot (no-op if already done)
@@ -34,6 +37,7 @@
 #   MediaMTX bin: /usr/local/bin/mediamtx       (installed in step 5)
 #   MediaMTX cfg: {INSTALL_DIR}/mediamtx/mediamtx.yaml  (written by provisioner.py)
 #   Capture dir : /var/vivarium/{device_id}/captures     (created in step 9)
+#   Python venv : {INSTALL_DIR}/venv                     (created in step 1.5)
 # =============================================================================
 
 set -euo pipefail
@@ -66,14 +70,25 @@ MEDIAMTX_BIN="/usr/local/bin/mediamtx"
 #
 # We now pin to a specific tested version.  To upgrade MediaMTX:
 #   1. Read the MediaMTX changelog for any YAML-breaking changes.
-#   2. Update mediamtx.example.yaml if the schema changed.
+#   2. Update mediamtx.example.yaml if the schema changed AND bump the
+#      'mediamtx_version_compat:' marker at the top of that file.
 #   3. Bump MEDIAMTX_VERSION below.
 #   4. Test on a real Pi before rolling out to all units.
+#   setup.sh step 3 will abort if MEDIAMTX_VERSION and the template marker differ.
 MEDIAMTX_VERSION="v1.9.3"   # pinned — only change after reading the changelog
 
 MEDIAMTX_TEMPLATE="${SCRIPT_DIR}/mediamtx/mediamtx.example.yaml"
 MEDIAMTX_YAML="${SCRIPT_DIR}/mediamtx/mediamtx.yaml"
 PROVISIONER_ENV="${SCRIPT_DIR}/provisioner.env"
+
+# ── Python virtual environment paths ──────────────────────────────────────────
+# All pip installs and python3 calls in this script go through the venv.
+# systemd service files reference this path via:
+#     ExecStart={{INSTALL_DIR}}/venv/bin/python3 ...
+# so that the services use the exact same interpreter + packages installed here.
+VENV_DIR="${SCRIPT_DIR}/venv"
+VENV_PYTHON="${VENV_DIR}/bin/python3"
+VENV_PIP="${VENV_DIR}/bin/pip"
 
 # ── Service user / group detection ───────────────────────────────────────────
 # $SUDO_USER is set by sudo to the name of the original (non-root) caller.
@@ -115,7 +130,7 @@ fi
 
 # Check for Python 3
 if ! command -v python3 &>/dev/null; then
-    die "python3 not found. Install it with: sudo apt install python3 python3-pip"
+    die "python3 not found. Install it with: sudo apt install python3 python3-pip python3-venv"
 fi
 ok "python3 found: $(python3 --version)"
 
@@ -131,6 +146,39 @@ if ! command -v curl &>/dev/null; then
 fi
 ok "curl found"
 
+echo ""
+
+# =============================================================================
+# 1.5. Create Python virtual environment
+#      All pip installs and python3 invocations in this script use the venv,
+#      keeping the system Python untouched and isolating pi/ dependencies from
+#      everything else on the Pi.
+#
+#      The venv is also referenced by the installed systemd unit files:
+#        ExecStart={{INSTALL_DIR}}/venv/bin/python3 ...
+#      so vivarium-bridge and vivarium-provisioner always run with the same
+#      interpreter and package set that were installed here.
+# =============================================================================
+
+echo -e "${BLD}── Python virtual environment ─────────────────────────────────────${RST}"
+
+if [[ -d "${VENV_DIR}" ]]; then
+    ok "Virtual environment already exists: ${VENV_DIR}"
+else
+    info "Creating virtual environment at ${VENV_DIR}..."
+    # python3-venv may not be installed on a fresh Raspberry Pi OS image.
+    if ! python3 -m venv "${VENV_DIR}" 2>/dev/null; then
+        info "python3-venv not available — installing python3-venv via apt..."
+        apt-get install -y python3-venv -q
+        python3 -m venv "${VENV_DIR}"
+    fi
+    ok "Virtual environment created: ${VENV_DIR}"
+fi
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    die "Virtual environment Python not found at ${VENV_PYTHON} — venv creation may have failed."
+fi
+ok "Using venv Python: $(${VENV_PYTHON} --version)"
 echo ""
 
 # =============================================================================
@@ -169,11 +217,17 @@ ok "Provisioning secret: [set]"
 echo ""
 
 # =============================================================================
-# 3. Assert MediaMTX template exists before doing anything irreversible
+# 3. Assert MediaMTX template exists AND is pinned to MEDIAMTX_VERSION
+#
 #    provisioner.py writes mediamtx/mediamtx.yaml by substituting placeholders
 #    in this template.  If the template is missing, provisioner.py exits 0
 #    (warning only) but mediamtx.yaml is never written → vivarium-camera.service
 #    fails on start.  Catch it early here so the error is obvious.
+#
+#    We also validate the template's version marker:
+#        # mediamtx_version_compat: vX.Y.Z
+#    must match MEDIAMTX_VERSION.  This ensures a stale template (written for a
+#    different MediaMTX release) is never silently paired with the wrong binary.
 # =============================================================================
 
 echo -e "${BLD}── Pre-flight checks ──────────────────────────────────────────────${RST}"
@@ -184,6 +238,25 @@ if [[ ! -f "${MEDIAMTX_TEMPLATE}" ]]; then
        Ensure the full pi/ directory was cloned from the repository."
 fi
 ok "MediaMTX template found: ${MEDIAMTX_TEMPLATE}"
+
+# Extract and validate the 'mediamtx_version_compat:' marker from the template.
+TEMPLATE_COMPAT="$(grep -m1 'mediamtx_version_compat:' "${MEDIAMTX_TEMPLATE}" \
+    | sed 's/.*mediamtx_version_compat:[[:space:]]*//' | tr -d '[:space:]')"
+
+if [[ -z "${TEMPLATE_COMPAT}" ]]; then
+    die "mediamtx.example.yaml is missing the 'mediamtx_version_compat:' marker.
+       Add the following line near the top of the template:
+           # mediamtx_version_compat: ${MEDIAMTX_VERSION}"
+fi
+
+if [[ "${TEMPLATE_COMPAT}" != "${MEDIAMTX_VERSION}" ]]; then
+    die "Template/version mismatch:
+       Template declares : ${TEMPLATE_COMPAT}
+       MEDIAMTX_VERSION  : ${MEDIAMTX_VERSION}
+       Either update mediamtx.example.yaml for ${MEDIAMTX_VERSION} and set its
+       compat marker to ${MEDIAMTX_VERSION}, or revert MEDIAMTX_VERSION to ${TEMPLATE_COMPAT}."
+fi
+ok "Template version matches MEDIAMTX_VERSION: ${MEDIAMTX_VERSION}"
 
 if [[ ! -f "${SCRIPT_DIR}/provisioner.py" ]]; then
     die "provisioner.py not found in ${SCRIPT_DIR}"
@@ -198,20 +271,28 @@ ok "requirements.txt found"
 echo ""
 
 # =============================================================================
-# 4. Install Python dependencies
+# 4. Install Python dependencies into the venv
 # =============================================================================
 
 echo -e "${BLD}── Python dependencies ────────────────────────────────────────────${RST}"
-info "Running: pip3 install -r ${SCRIPT_DIR}/requirements.txt"
-pip3 install --break-system-packages -q -r "${SCRIPT_DIR}/requirements.txt"
-ok "Python dependencies installed"
+info "Running: ${VENV_PIP} install -r ${SCRIPT_DIR}/requirements.txt"
+"${VENV_PIP}" install -q -r "${SCRIPT_DIR}/requirements.txt"
+ok "Python dependencies installed into venv"
 echo ""
 
 # =============================================================================
-# 5. Download and install MediaMTX
+# 5. Download and install MediaMTX (pinned version)
+#
+#    We build the download URL directly from MEDIAMTX_VERSION and MEDIAMTX_ARCH
+#    — no GitHub API call for "latest".  This guarantees the installed binary
+#    matches the template and the YAML schema that was tested.
+#
+#    URL pattern:
+#      https://github.com/bluenviron/mediamtx/releases/download/{VERSION}/
+#          mediamtx_{VERSION}_{ARCH}.tar.gz
 # =============================================================================
 
-echo -e "${BLD}── MediaMTX ────────────────────────────────────────────────────────${RST}"
+echo -e "${BLD}── MediaMTX ${MEDIAMTX_VERSION} ───────────────────────────────────────────────────${RST}"
 
 if [[ -f "${MEDIAMTX_BIN}" ]]; then
     ok "MediaMTX already installed at ${MEDIAMTX_BIN} — skipping download"
@@ -227,25 +308,18 @@ else
     esac
     ok "Architecture: ${ARCH} → MediaMTX variant: ${MEDIAMTX_ARCH}"
 
-    info "Fetching latest MediaMTX release..."
-    MEDIAMTX_LATEST_URL="$(curl -fsSL https://api.github.com/repos/bluenviron/mediamtx/releases/latest \
-        | python3 -c "import sys,json; data=json.load(sys.stdin); \
-          print(next(a['browser_download_url'] for a in data['assets'] \
-          if '${MEDIAMTX_ARCH}' in a['name'] and a['name'].endswith('.tar.gz')))")"
-
-    if [[ -z "${MEDIAMTX_LATEST_URL}" ]]; then
-        die "Could not find MediaMTX download URL for ${MEDIAMTX_ARCH}"
-    fi
-    ok "Download URL: ${MEDIAMTX_LATEST_URL}"
+    # Build the direct download URL for the pinned version — no API call needed.
+    MEDIAMTX_DOWNLOAD_URL="https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_${MEDIAMTX_ARCH}.tar.gz"
+    ok "Download URL: ${MEDIAMTX_DOWNLOAD_URL}"
 
     TMP_DIR="$(mktemp -d)"
-    info "Downloading to ${TMP_DIR}..."
-    curl -fsSL "${MEDIAMTX_LATEST_URL}" -o "${TMP_DIR}/mediamtx.tar.gz"
+    info "Downloading MediaMTX ${MEDIAMTX_VERSION} to ${TMP_DIR}..."
+    curl -fsSL "${MEDIAMTX_DOWNLOAD_URL}" -o "${TMP_DIR}/mediamtx.tar.gz"
     tar -xzf "${TMP_DIR}/mediamtx.tar.gz" -C "${TMP_DIR}"
     cp "${TMP_DIR}/mediamtx" "${MEDIAMTX_BIN}"
     chmod +x "${MEDIAMTX_BIN}"
     rm -rf "${TMP_DIR}"
-    ok "MediaMTX installed to ${MEDIAMTX_BIN}"
+    ok "MediaMTX ${MEDIAMTX_VERSION} installed to ${MEDIAMTX_BIN}"
 fi
 
 echo ""
@@ -276,7 +350,7 @@ chmod 600 "${PROVISIONER_ENV}"
 info "Temporary provisioner.env written (mode 600)"
 
 # =============================================================================
-# 7. Run provisioner.py
+# 7. Run provisioner.py (via venv Python)
 #    Writes two files:
 #      /etc/vivarium/device.conf      (mode 600, owner SERVICE_USER)
 #      mediamtx/mediamtx.yaml         (mode 600, owner SERVICE_USER)
@@ -290,7 +364,7 @@ info "Running provisioner.py..."
     export GANTRY_PROVISIONING_SECRET="${GANTRY_PROVISIONING_SECRET}"
     export GANTRY_MQTT_BROKER="${GANTRY_MQTT_BROKER}"
     export GANTRY_SERVICE_USER="${SERVICE_USER}"
-    python3 "${SCRIPT_DIR}/provisioner.py"
+    "${VENV_PYTHON}" "${SCRIPT_DIR}/provisioner.py"
 )
 ok "provisioner.py exited successfully"
 
@@ -322,7 +396,7 @@ ok "${MEDIAMTX_YAML} written"
 #    unless we create it here.
 # =============================================================================
 
-DEVICE_ID="$(python3 -c "
+DEVICE_ID="$("${VENV_PYTHON}" -c "
 import configparser
 p = configparser.ConfigParser()
 p.read('${DEVICE_CONF_PATH}')
@@ -360,6 +434,10 @@ echo ""
 #     vivarium-bridge and vivarium-camera use all three.
 #     vivarium-provisioner keeps User=root intentionally (needs root to
 #     create /etc/vivarium/) but {{INSTALL_DIR}} is still substituted.
+#
+#     The Python service files (vivarium-bridge, vivarium-provisioner) use:
+#       ExecStart={{INSTALL_DIR}}/venv/bin/python3 ...
+#     so they run with the exact interpreter + packages installed in step 4.
 # =============================================================================
 
 echo -e "${BLD}── systemd services ───────────────────────────────────────────────${RST}"
@@ -388,6 +466,7 @@ for SERVICE in vivarium-provisioner vivarium-bridge vivarium-camera; do
     chmod 644 "${DEST_FILE}"
     ok "Installed ${SERVICE}.service → ${DEST_FILE}"
 done
+
 # Add SERVICE_USER to the "video" group — required by vivarium-camera.service
 # which sets SupplementaryGroups=video so MediaMTX can access /dev/video* and
 # /dev/dma_heap (Pi Camera). Without this the camera service gets permission
@@ -398,6 +477,7 @@ if id -u "${SERVICE_USER}" &>/dev/null; then
 else
     err "Could not add ${SERVICE_USER} to video group — user not found"
 fi
+
 # Reload systemd to pick up new unit files
 systemctl daemon-reload
 ok "systemd daemon reloaded"
@@ -423,7 +503,7 @@ ok "vivarium-provisioner started (no-op — device.conf already written)"
 
 # Start camera first so the RTSP stream is ready before the bridge connects.
 systemctl start vivarium-camera
-ok "vivarium-camera started (MediaMTX live stream)"
+ok "vivarium-camera started (MediaMTX ${MEDIAMTX_VERSION} live stream)"
 
 systemctl start vivarium-bridge
 ok "vivarium-bridge started (MQTT ↔ Serial ↔ Arduino)"
@@ -443,7 +523,9 @@ echo -e "  ${BLD}Service user:${RST}     ${SERVICE_USER}:${SERVICE_GROUP}"
 echo -e "  ${BLD}Server:${RST}           ${GANTRY_SERVER_URL}"
 echo -e "  ${BLD}MQTT broker:${RST}      ${GANTRY_MQTT_BROKER}"
 echo -e "  ${BLD}Config file:${RST}      ${DEVICE_CONF_PATH}"
+echo -e "  ${BLD}MediaMTX:${RST}         ${MEDIAMTX_BIN} (${MEDIAMTX_VERSION})"
 echo -e "  ${BLD}MediaMTX config:${RST}  ${MEDIAMTX_YAML}"
+echo -e "  ${BLD}Python venv:${RST}      ${VENV_DIR}"
 if [[ -n "${DEVICE_ID}" ]]; then
     echo -e "  ${BLD}Capture dir:${RST}      /var/vivarium/${DEVICE_ID}/captures"
 fi

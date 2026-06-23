@@ -145,9 +145,9 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
   });
 
   // Connectivity
-  const [wsStatus, setWsStatus]         = useState<WsStatus>('disconnected');
+  const [wsStatus, setWsStatus]           = useState<WsStatus>('disconnected');
   const [mqttConnected, setMqttConnected] = useState(false);
-  const [piOnline, setPiOnline]         = useState(false);
+  const [piOnline, setPiOnline]           = useState(false);
 
   // Rack
   const [activeRackId, setActiveRackId] = useState<string | null>(null);
@@ -211,6 +211,10 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
         break;
 
       case 'status': {
+        // NOTE (Mismatch 5): WsMsgStatus.data carries ONLY heartbeat fields
+        // (status, camera_status, ts, device_id). Position data (x, y, c,
+        // homed_*) and scan_state arrive via the "response" subtopic as raw
+        // M114 strings, handled in the 'response' case below.
         const d = msg.data;
         if (d.status === 'online' || d.ts !== undefined) {
           resetPiHeartbeat();
@@ -218,26 +222,22 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
         if (d.status === 'offline') {
           setPiOnline(false);
         }
-        if (d.x !== undefined || d.y !== undefined || d.c !== undefined) {
-          setGantryPosition(prev => ({
-            x: d.x ?? prev.x,
-            y: d.y ?? prev.y,
-            c: d.c ?? prev.c,
-            homed_x: d.homed_x ?? prev.homed_x,
-            homed_y: d.homed_y ?? prev.homed_y,
-            homed_c: d.homed_c ?? prev.homed_c,
-          }));
-        }
-        if (d.scan_state) setScanState(d.scan_state);
         break;
       }
 
       case 'stream_url':
         // Server sends direct Pi URLs: url = WHEP, mjpeg_url = MJPEG fallback
         setStreamUrl(msg.data.url || null);
-        setMjpegUrl(msg.data.mjpeg_url || null);
+        setMjpegUrl(msg.data.mjpeg_url ?? null);
         break;
 
+      // BUG FIX: stream_close was missing from the switch.
+      // Without this case, when the server broadcasts stream_close (on
+      // DELETE /lock, emergency stop, or lock-sweep expiry), the message
+      // fell through to `default` and did nothing.  streamUrl / mjpegUrl
+      // stayed set in React state, so CameraPanel kept trying to hold the
+      // WebRTC connection open on stale URLs — showing a frozen frame or a
+      // WebRTC error banner instead of the "Awaiting lock" placeholder.
       case 'lock_released':
         setStreamUrl(null);
         setMjpegUrl(null);
@@ -274,7 +274,8 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
       }
 
       case 'alert': {
-        const alertMsg = msg as unknown as WsMsgAlert;
+        // WsMsgAlert is already the correct shape — no unsafe cast needed.
+        const alertMsg = msg as WsMsgAlert;
         const entry: AlertEntry = {
           id: crypto.randomUUID(),
           rackId: alertMsg.rack_id,
@@ -291,9 +292,12 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
         // The server relays all MQTT "response" subtopic messages to WS.
         // M114 lines arrive here: "M114 X:12.50 Y:24.00 C:0.00 homed:X=Y Y=Y C=N"
         // Other messages (COMMAND_ACK:M700, BRIDGE_RECONNECTED, etc.) are skipped.
+        // Position (x/y/c) and scan_state are ONLY updated from here (Mismatch 5).
         const raw = typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data ?? '');
+
+        // Parse M114 position line
         const m114Match = raw.match(
-          /X:([-\d.]+)\s+Y:([-\d.]+)\s+C:([-\d.]+).*homed:X=([YN])\s*Y=([YN])\s*C=([YN])/i
+          /X:([-\d.]+)\s+Y:([-\d.]+)\s+C:([-\d.]+).*homed:X=([YN])\s*Y=([YN])\s*C=([YN])/i,
         );
         if (m114Match) {
           setGantryPosition({
@@ -304,6 +308,13 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
             homed_y: m114Match[5].toUpperCase() === 'Y',
             homed_c: m114Match[6].toUpperCase() === 'Y',
           });
+        }
+
+        // Parse scan state updates carried in raw response strings, e.g.
+        // "SCAN_STATE:running" — adjust the regex to match your Pi firmware.
+        const scanMatch = raw.match(/SCAN_STATE:(idle|running|paused|complete|aborted)/i);
+        if (scanMatch) {
+          setScanState(scanMatch[1].toLowerCase() as ScanState);
         }
         break;
       }
@@ -353,7 +364,8 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
   const logout = useCallback(() => {
     sessionStorage.removeItem('vivarium_auth');
     setAuth(null);
-    setWsStatus('disconnected');
+    // wsClient.close() is triggered by the auth?.token effect above when
+    // auth becomes null — no need to call it here directly.
     setPiOnline(false);
     setStreamUrl(null);
     setMjpegUrl(null);

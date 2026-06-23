@@ -222,14 +222,16 @@ class MediaMTXHealth:
           2. The path name matching settings.stream_name is present.
           3. The path's 'ready' flag is True.
 
-        BUG FIX: Previously only the path name was checked (#1 and #2 above).
         With sourceOnDemand:true in mediamtx.yaml, MediaMTX registers the
-        path immediately at startup but leaves ready=false until someone
-        actually starts watching. This means the old code reported
-        camera_status='online' even when the camera ribbon cable was
-        completely unplugged — the crash only surfaced when a user opened
-        the stream. We now require ready=true, which MediaMTX only sets once
-        the camera hardware has been opened successfully.
+        path at startup but sets ready=false until an active viewer connects
+        (at which point the camera hardware is opened). The heartbeat runs
+        every 30 s when nobody is watching, so requiring ready=true would
+        always report camera_status='offline' even when MediaMTX is running
+        perfectly and the camera is healthy.
+
+        Fix: treat path-present (regardless of ready flag) as "online" —
+        the service is up and the stream will start on demand. Only return
+        "offline" when the path is absent entirely or the API is unreachable.
         """
         try:
             import urllib.request
@@ -252,21 +254,15 @@ class MediaMTXHealth:
                 if not isinstance(item, dict):
                     continue
                 if item.get("name", "") == expected:
-                    # BUG FIX: check 'ready', not just presence.
-                    # ready=false means path is configured but camera hardware
-                    # has not been opened yet (sourceOnDemand=true and no
-                    # active viewer, or the camera failed to initialise).
-                    ready = item.get("ready", False)
-                    if ready:
-                        logger.debug("MediaMTX API: path %r ready=True → online", expected)
-                        return self._set("online")
-                    else:
-                        logger.debug(
-                            "MediaMTX API: path %r present but ready=False → offline "
-                            "(sourceOnDemand: camera not yet open, or hardware error)",
-                            expected,
-                        )
-                        return self._set("offline")
+                    # Path registered = MediaMTX is running and configured correctly.
+                    # ready=False just means sourceOnDemand and no active viewer —
+                    # that's normal when nobody is watching. The camera will open
+                    # on demand when a WHEP viewer connects.
+                    logger.debug(
+                        "MediaMTX API: path %r present (ready=%s) → online",
+                        expected, item.get("ready"),
+                    )
+                    return self._set("online")
 
             # Path not found at all
             path_names = [i.get("name") for i in items if isinstance(i, dict)]

@@ -7,6 +7,11 @@
 # {{SERVICE_USER}} / {{SERVICE_GROUP}} are substituted by setup.sh from the
 # account that ran  sudo bash setup.sh  ($SUDO_USER).  Do not hard-code "pi"
 # here — modern Raspberry Pi OS lets operators choose their own username.
+#
+# Python interpreter: {{INSTALL_DIR}}/venv/bin/python3
+#   setup.sh creates the venv and installs requirements.txt into it (step 1.5
+#   and step 4).  Using the venv here ensures the service runs with the exact
+#   same interpreter and package versions that were tested during setup.
 # =============================================================================
 
 [Unit]
@@ -22,8 +27,8 @@ User={{SERVICE_USER}}
 Group={{SERVICE_GROUP}}
 WorkingDirectory={{INSTALL_DIR}}
 
-# Run bridge.py directly — works whether pi/ is on sys.path or not.
-ExecStart=/usr/bin/python3 {{INSTALL_DIR}}/bridge.py
+# Use the venv Python so the service uses the packages installed by setup.sh.
+ExecStart={{INSTALL_DIR}}/venv/bin/python3 {{INSTALL_DIR}}/bridge.py
 
 # Auto-restart on failure, 5s cooldown.
 # After 10 failures in 60s, systemd marks it failed so an admin can investigate.

@@ -66,18 +66,14 @@ def build_stream_url(rack_id: str) -> dict[str, Any]:
     Build the stream_url WebSocket message for rack_id (Section 8).
 
     Direct-Pi URL approach (no server proxy):
-        WebRTC (WHEP): http://{MEDIAMTX_PI_HOST}:{MEDIAMTX_WEBRTC_PORT}/{rack_id}/whep
-        MJPEG fallback: http://{MEDIAMTX_PI_HOST}:{MEDIAMTX_MJPEG_PORT}/{rack_id}/mjpeg
+        WebRTC (WHEP): http://{pi_host}:{MEDIAMTX_WEBRTC_PORT}/{rack_id}/whep
+        MJPEG fallback: http://{pi_host}:{MEDIAMTX_MJPEG_PORT}/{rack_id}/mjpeg
 
-    The browser connects directly to the Pi's MediaMTX instance, so there is
-    no video traffic on the Uvicorn server.  The Pi must be on the same
-    LAN/Wi-Fi network as the browser for these URLs to work.
-
-    If MEDIAMTX_PI_HOST is not configured, both URLs are returned as empty
-    strings and CameraPanel will show a configuration warning instead of a
-    broken video element.
+    Host is read directly from MEDIAMTX_PI_HOST in server/.env.
+    DB lookup removed for testing — add back once racks are provisioned.
     """
     host = settings.MEDIAMTX_PI_HOST.strip()
+
     if host:
         webrtc_url = f"http://{host}:{settings.MEDIAMTX_WEBRTC_PORT}/{rack_id}/whep"
         mjpeg_url  = f"http://{host}:{settings.MEDIAMTX_MJPEG_PORT}/{rack_id}/mjpeg"

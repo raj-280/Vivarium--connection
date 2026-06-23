@@ -6,6 +6,11 @@
 # checks if /etc/vivarium/device.conf already exists and returns 0 if it does).
 #
 # Runs BEFORE vivarium-bridge.service and vivarium-camera.service.
+#
+# Python interpreter: {{INSTALL_DIR}}/venv/bin/python3
+#   setup.sh creates the venv and installs requirements.txt into it (step 1.5
+#   and step 4).  Using the venv here ensures the service runs with the exact
+#   same interpreter and package versions that were tested during setup.
 # =============================================================================
 
 [Unit]
@@ -41,7 +46,8 @@ WorkingDirectory={{INSTALL_DIR}}
 # To re-provision: run setup.sh again (it will re-create provisioner.env).
 EnvironmentFile=-{{INSTALL_DIR}}/provisioner.env
 
-ExecStart=/usr/bin/python3 {{INSTALL_DIR}}/provisioner.py
+# Use the venv Python so the service uses the packages installed by setup.sh.
+ExecStart={{INSTALL_DIR}}/venv/bin/python3 {{INSTALL_DIR}}/provisioner.py
 
 # Keep the unit "active" after exit so vivarium-bridge.service's Requires= is
 # satisfied on subsequent boots (where the unit is a ConditionPathExists no-op).
