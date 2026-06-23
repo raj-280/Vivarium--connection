@@ -1,81 +1,57 @@
 """
 pi/config/settings.py
 
+Typed settings reader for pi/config/device.conf.
+
+The config file path is ALWAYS:
+    /etc/vivarium/device.conf
+
+This is a permanent system path written ONCE by pi/provisioner.py on first
+boot (mode 600, owned pi:pi). It survives git pulls and redeployments.
+
+On a dev machine without a real Pi, create it manually:
+    sudo mkdir -p /etc/vivarium
+    sudo cp pi/device.conf.example /etc/vivarium/device.conf
+    sudo chown $USER /etc/vivarium/device.conf
+
+If the file does not exist, all values fall back to _DEFAULTS so the bridge
+can start with sensible placeholder values without crashing.
+
+For unit tests, pass conf_path= to the Settings() constructor.
 """
 
 from __future__ import annotations
 
 import configparser
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-# ── Path resolution ────────────────────────────────────────────────────────
+# ── Config file location ──────────────────────────────────────────────────────
+#
+# Permanent system path: /etc/vivarium/device.conf
+#
+# This file is written ONCE by pi/provisioner.py on first boot (mode 600,
+# owned root:pi) and then only read — never overwritten by a code update,
+# git pull, or redeploy.  Keeping it in /etc/ means the Pi's identity and
+# credentials survive the entire software lifecycle.
+#
+# DO NOT move this back into the repo/install directory; that would cause
+# device.conf to be lost or exposed on every redeploy.
 
-DEFAULT_DEVICE_CONF_PATH = "/etc/gantry/device.conf"
-ENV_OVERRIDE_VAR = "GANTRY_DEVICE_CONF"
-
-
-def _resolve_conf_path() -> str:
-    """
-    Resolution order:
-      1. GANTRY_DEVICE_CONF env var  (local dev — set this to any path)
-      2. /etc/gantry/device.conf     (real Pi deployment, provisioned by setup.sh)
-      3. device.conf next to this settings.py file  (development fallback —
-         works automatically when running from the repo root without any .env
-         or system-level install, e.g. `python -m pi.bridge` in the repo dir)
-
-    If GANTRY_DEVICE_CONF is set but points at a file that doesn't exist
-    (e.g. a stale value left in the shell/IDE env from a previous Pi-style
-    test), we don't hard-fail here — we log a warning and fall through to
-    steps 2/3 instead of returning a path that will never resolve. This used
-    to be what bit local/dev runs: an override pointed at a missing
-    /etc/gantry/device.conf-style path and silently shadowed the perfectly
-    good pi/config/device.conf sitting right next to this file.
-    """
-    local_conf = Path(__file__).parent / "device.conf"
-
-    override = os.environ.get(ENV_OVERRIDE_VAR)
-    if override:
-        if Path(override).is_file():
-            logger.info("Using device.conf from %s=%s", ENV_OVERRIDE_VAR, override)
-            return override
-        logger.warning(
-            "%s=%s is set but no file exists at that path. "
-            "Falling back to default resolution instead of failing outright.",
-            ENV_OVERRIDE_VAR,
-            override,
-        )
-
-    if Path(DEFAULT_DEVICE_CONF_PATH).is_file():
-        logger.info("Using device.conf from %s", DEFAULT_DEVICE_CONF_PATH)
-        return DEFAULT_DEVICE_CONF_PATH
-
-    # Development fallback: look for device.conf in the same directory as
-    # this settings.py file (i.e. pi/config/device.conf).
-    if local_conf.is_file():
-        logger.info("Using device.conf from local dev fallback %s", local_conf)
-        return str(local_conf)
-
-    # No file found anywhere — return the default path anyway;
-    # Settings.__init__ will detect loaded_from_file=False, log a clear
-    # warning naming every path that was tried, and fall back to _DEFAULTS.
-    logger.warning(
-        "No device.conf found. Tried: %s, %s, %s. Using built-in defaults.",
-        override or "(GANTRY_DEVICE_CONF not set)",
-        DEFAULT_DEVICE_CONF_PATH,
-        local_conf,
-    )
-    return DEFAULT_DEVICE_CONF_PATH
+DEVICE_CONF_PATH: Path = Path("/etc/vivarium/device.conf")
 
 
-# ── Local-dev fallback defaults ──────────────────────────────────────────────
-# Used only if the config file doesn't exist at all (e.g. before provisioning,
-# or during early bridge.py development). Mirrors the groups in Section 2.2.
+# ── Built-in fallback defaults ────────────────────────────────────────────────
+#
+# Used ONLY when device.conf does not exist yet (before first provisioning, or
+# during early local dev). Once the provisioner writes device.conf these are
+# ignored — the file's values always take precedence.
+#
+# Keep in sync with what provisioner._write_device_conf() writes.
 
 _DEFAULTS: dict[str, dict[str, str]] = {
     "identity": {
@@ -95,19 +71,25 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "ca_cert_path": "",
     },
     "serial": {
-        "serial_port": "/dev/ttyACM0",
+        # "auto" → SerialHandler.connect() scans /dev/ttyACM* and /dev/ttyUSB*
+        # and uses the first Arduino it finds. Pin to a specific port (e.g.
+        # /dev/ttyACM0) in device.conf only if you have multiple serial devices.
+        "serial_port": "auto",
         "serial_baud": "115200",
-        "serial_timeout_s": "5",
+        # 10 s: enough headroom for slow firmware responses (M700 rack moves,
+        # homing sequences) without hanging forever on a disconnected Arduino.
+        "serial_timeout_s": "10",
         "serial_retry_count": "1",
     },
     "capture": {
         "capture_dir": "./captures",
         "batch_upload_enabled": "false",
+        # true on a real Pi (/tmp is RAM-backed tmpfs); false on dev machines.
         "tmp_is_tmpfs": "false",
     },
     "streaming": {
-        "go2rtc_port": "8554",
-        "go2rtc_stream_name": "rack-test",
+        "mediamtx_port": "8554",
+        "stream_name": "rack-test",
     },
     "scan": {
         "scan_lock_keepalive_interval_s": "30",
@@ -117,61 +99,83 @@ _DEFAULTS: dict[str, dict[str, str]] = {
 
 class Settings:
     """
-    Typed view over device.conf (Section 2.2).
+    Typed view over pi/config/device.conf.
 
-    Group → key mapping mirrors the table in Section 2.2 exactly:
+    Automatically finds the config file at:
+        pi/config/device.conf   (same directory as this settings.py)
+
+    Group -> key mapping (Section 2.2):
       [identity]  device_id, cpu_serial
       [server]    server_host, presign_api_key, mqtt_password, rtsp_password
       [mqtt]      broker_host, broker_port, mqtt_use_tls, ca_cert_path
       [serial]    serial_port, serial_baud, serial_timeout_s, serial_retry_count
       [capture]   capture_dir, batch_upload_enabled, tmp_is_tmpfs
-      [streaming] go2rtc_port, go2rtc_stream_name
+      [streaming] mediamtx_port, stream_name
       [scan]      scan_lock_keepalive_interval_s
     """
 
     def __init__(self, conf_path: Optional[str] = None) -> None:
-        self.conf_path = conf_path or _resolve_conf_path()
+        # conf_path is accepted only for unit tests that need to inject a
+        # custom path. All production code leaves it None and gets the
+        # pi/config/device.conf path automatically via DEVICE_CONF_PATH.
+        self.conf_path: str = conf_path if conf_path is not None else str(DEVICE_CONF_PATH)
+
         self._parser = configparser.ConfigParser()
 
-        # Seed with defaults first so missing keys/sections still resolve.
+        # Seed with built-in defaults first so every key has a value even if
+        # the file is missing or incomplete.
         self._parser.read_dict(_DEFAULTS)
 
         if Path(self.conf_path).is_file():
-            self._parser.read(self.conf_path)
+            # Read and normalise line endings before parsing.  device.conf is
+            # often committed/transferred from Windows and arrives on the Pi
+            # with \r\n endings.  configparser would then store keys as
+            # "broker_host\r" instead of "broker_host", silently missing every
+            # lookup and falling back to the _DEFAULTS that read_dict() seeded.
+            _raw = Path(self.conf_path).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            self._parser.read_string(_raw)
             self.loaded_from_file = True
+            logger.info("Settings loaded from %s", self.conf_path)
         else:
             self.loaded_from_file = False
+            logger.warning(
+                "device.conf not found at %s — using built-in defaults. "
+                "Run pi/provisioner.py to generate it.",
+                self.conf_path,
+            )
 
         # ── Identity ──────────────────────────────────────────────────────
-        self.device_id: str = self._get("identity", "device_id")
-        self.cpu_serial: str = self._get("identity", "cpu_serial")
+        self.device_id: str          = self._get("identity", "device_id")
+        self.cpu_serial: str         = self._get("identity", "cpu_serial")
 
         # ── Server ────────────────────────────────────────────────────────
-        self.server_host: str = self._get("server", "server_host")
-        self.presign_api_key: str = self._get("server", "presign_api_key")
-        self.mqtt_password: str = self._get("server", "mqtt_password")
-        self.rtsp_password: str = self._get("server", "rtsp_password")
+        self.server_host: str        = self._get("server", "server_host")
+        self.presign_api_key: str    = self._get("server", "presign_api_key")
+        self.mqtt_password: str      = self._get("server", "mqtt_password")
+        self.rtsp_password: str      = self._get("server", "rtsp_password")
 
         # ── MQTT ──────────────────────────────────────────────────────────
-        self.broker_host: str = self._get("mqtt", "broker_host")
-        self.broker_port: int = self._get_int("mqtt", "broker_port")
-        self.mqtt_use_tls: bool = self._get_bool("mqtt", "mqtt_use_tls")
-        self.ca_cert_path: str = self._get("mqtt", "ca_cert_path")
+        self.broker_host: str        = self._get("mqtt", "broker_host")
+        self.broker_port: int        = self._get_int("mqtt", "broker_port")
+        self.mqtt_use_tls: bool      = self._get_bool("mqtt", "mqtt_use_tls")
+        self.ca_cert_path: str       = self._get("mqtt", "ca_cert_path")
 
         # ── Serial ────────────────────────────────────────────────────────
-        self.serial_port: str = self._get("serial", "serial_port")
-        self.serial_baud: int = self._get_int("serial", "serial_baud")
+        # serial_port == "auto" means SerialHandler will scan and pick
+        # the first /dev/ttyACM* or /dev/ttyUSB* it finds.
+        self.serial_port: str        = self._get("serial", "serial_port")
+        self.serial_baud: int        = self._get_int("serial", "serial_baud")
         self.serial_timeout_s: float = self._get_float("serial", "serial_timeout_s")
         self.serial_retry_count: int = self._get_int("serial", "serial_retry_count")
 
         # ── Camera / Capture ──────────────────────────────────────────────
-        self.capture_dir: str = self._get("capture", "capture_dir")
-        self.batch_upload_enabled: bool = self._get_bool("capture", "batch_upload_enabled")
-        self.tmp_is_tmpfs: bool = self._get_bool("capture", "tmp_is_tmpfs")
+        self.capture_dir: str              = self._get("capture", "capture_dir")
+        self.batch_upload_enabled: bool    = self._get_bool("capture", "batch_upload_enabled")
+        self.tmp_is_tmpfs: bool            = self._get_bool("capture", "tmp_is_tmpfs")
 
         # ── Streaming ─────────────────────────────────────────────────────
-        self.go2rtc_port: int = self._get_int("streaming", "go2rtc_port")
-        self.go2rtc_stream_name: str = self._get("streaming", "go2rtc_stream_name")
+        self.mediamtx_port: int            = self._get_int("streaming", "mediamtx_port")
+        self.stream_name: str              = self._get("streaming", "stream_name")
 
         # ── Scan engine ───────────────────────────────────────────────────
         self.scan_lock_keepalive_interval_s: float = self._get_float(
@@ -190,7 +194,9 @@ class Settings:
         return self._parser.getfloat(section, key, fallback=float(_DEFAULTS[section][key]))
 
     def _get_bool(self, section: str, key: str) -> bool:
-        return self._parser.getboolean(section, key, fallback=_DEFAULTS[section][key].lower() == "true")
+        return self._parser.getboolean(
+            section, key, fallback=_DEFAULTS[section][key].lower() == "true"
+        )
 
     def __repr__(self) -> str:
         return (
@@ -202,6 +208,6 @@ class Settings:
         )
 
 
-# ── Module-level singleton ───────────────────────────────────────────────────
-# Other modules: `from config.settings import settings`
+# ── Module-level singleton ────────────────────────────────────────────────────
+# Other modules import:  from config.settings import settings
 settings = Settings()

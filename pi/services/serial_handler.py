@@ -207,11 +207,11 @@ class SerialHandler:
             self._serial.close()
             time.sleep(9.0)          # Caterina timeout 8 s + 1 s margin
             self._serial.open()
+            time.sleep(3.0)          # extra settle for Mega re-enumeration
         else:
             # FTDI/ttyUSB: no re-enumeration, shorter wait is fine
             time.sleep(2.0)
     
-        time.sleep(3.0)
         self._serial.reset_input_buffer() 
  
         # Start the background reader
@@ -310,7 +310,7 @@ class SerialHandler:
                 # wire, before any line-splitting. Proves whether multiple
                 # lines arrive together, and whether the real response ever
                 # physically reaches the Pi at all.
-                logger.info("Serial RAW chunk: %r", chunk)
+                logger.debug("Serial RAW chunk: %r", chunk)
 
                 buffer += chunk
                 while b"\n" in buffer:
@@ -356,7 +356,7 @@ class SerialHandler:
         # DIAGNOSTIC: log the routing decision for every line so we can see
         # whether the real response ever reaches the "waiting" branch or
         # gets dropped into "unsolicited" instead.
-        logger.info("Serial ROUTE: line=%r waiting=%s", line, waiting)
+        logger.debug("Serial ROUTE: line=%r waiting=%s", line, waiting)
 
         if waiting:
             self._response_queue.put(line)

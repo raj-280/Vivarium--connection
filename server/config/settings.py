@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     BACKEND_HOST: str = Field(default="127.0.0.1")
     BACKEND_PORT: int = Field(default=8000)
+    # The routable IP or hostname written into the Pi's device.conf server_host.
+    # BACKEND_HOST is a bind address (0.0.0.0) and cannot be used by the Pi.
+    # Leave blank to auto-use MQTT_BROKER (works when server + broker are on
+    # the same machine). Set to your machine's LAN IP if they differ.
+    # Example: SERVER_HOST=192.168.1.100
+    SERVER_HOST: str = Field(
+        default="",
+        description=(
+            "Routable IP/hostname written into device.conf server_host during provisioning. "
+            "Leave blank to auto-derive from MQTT_BROKER."
+        ),
+    )
     CORS_ALLOWED_ORIGINS: list[str] = Field(
         default=["http://localhost:5173", "http://localhost:3000"],
         description="Origins the browser is allowed to connect from",
@@ -197,13 +209,42 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Streaming  (Section 2.1 — Streaming group)
     # -------------------------------------------------------------------------
-    GO2RTC_INTERNAL_URL: str = Field(
-        default="http://localhost:1984",
-        description="go2rtc API base URL on the server (localhost-only, never exposed)",
+    MEDIAMTX_INTERNAL_URL: str = Field(
+        default="",
+        description=(
+            "MediaMTX REST API base URL on the Raspberry Pi "
+            "(e.g. http://192.168.1.50:9997). "
+            "Must be set to the Pi's LAN IP — MediaMTX runs on the Pi, NOT on this server. "
+            "Leave blank to skip the health probe and still issue stream URLs."
+        ),
     )
-    GO2RTC_PROXY_PATH: str = Field(
+    # MEDIAMTX_PI_HOST is the LAN IP (or hostname) of the Raspberry Pi, used to
+    # build direct stream URLs sent to the browser.  The browser connects straight
+    # to MediaMTX — no server proxy needed, and no load on Uvicorn for video.
+    # Must be reachable from the browser (i.e. same LAN/Wi-Fi as the Pi).
+    # Example: MEDIAMTX_PI_HOST=192.168.1.50
+    MEDIAMTX_PI_HOST: str = Field(
+        default="",
+        description=(
+            "LAN IP or hostname of the Raspberry Pi running MediaMTX "
+            "(e.g. 192.168.1.50). The browser connects directly to the Pi "
+            "for WebRTC/MJPEG — no server proxy. "
+            "Must be reachable from the browser's network."
+        ),
+    )
+    MEDIAMTX_WEBRTC_PORT: int = Field(
+        default=8889,
+        description="MediaMTX WebRTC (WHEP) port on the Pi (default 8889)",
+    )
+    MEDIAMTX_MJPEG_PORT: int = Field(
+        default=8888,
+        description="MediaMTX HLS/MJPEG port on the Pi (default 8888)",
+    )
+    # STREAM_PROXY_PATH kept for backward-compat / docs; no longer used for URL
+    # generation since we switched to direct Pi URLs.
+    STREAM_PROXY_PATH: str = Field(
         default="/camera",
-        description="Nginx reverse-proxy prefix for go2rtc (WebRTC/MJPEG endpoints)",
+        description="[UNUSED] Legacy reverse-proxy prefix — direct Pi URLs are now used instead.",
     )
     STREAM_URL_TTL_S: int = Field(
         default=3600,

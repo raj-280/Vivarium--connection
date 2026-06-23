@@ -13,11 +13,14 @@ const appConfig = {
   /** Base URL for HTTP REST calls (auth/login, /command, /lock, etc.) */
   apiBaseUrl: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000',
 
-  /** go2rtc WebRTC stream base path — Section 8 */
-  streamBasePath: import.meta.env.VITE_STREAM_BASE_PATH ?? '/camera/api/webrtc',
+  /** MediaMTX WebRTC (WHEP) base path — Section 8.
+   *  Full URL: {streamBasePath}/{rack_id}/whep
+   *  Server sends this via stream_url WebSocket message. */
+  streamBasePath: import.meta.env.VITE_STREAM_BASE_PATH ?? '/camera',
 
-  /** go2rtc MJPEG fallback path — Section 8 */
-  mjpegBasePath: import.meta.env.VITE_MJPEG_BASE_PATH ?? '/camera/mjpeg',
+  /** MediaMTX MJPEG fallback base path — Section 8.
+   *  Full URL: {mjpegBasePath}/{rack_id}/mjpeg */
+  mjpegBasePath: import.meta.env.VITE_MJPEG_BASE_PATH ?? '/camera',
 
   /** Default rack dimensions (mirrors RACK_ROWS / RACK_COLS server defaults) */
   rackRows: Number(import.meta.env.VITE_RACK_ROWS ?? 12),

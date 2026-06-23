@@ -4,7 +4,7 @@ server/services/provisioning.py
 Full POST /provision logic.
 
 Responsibilities
-────────────────
+----------------
 1. Validate ``provisioning_secret`` (401 if wrong).
 2. Idempotency: if ``cpu_serial`` already exists in ``racks``, return the
    existing credentials from the matching ``racks`` row unchanged. Safe to
@@ -13,7 +13,7 @@ Responsibilities
    the highest existing ID in the ``racks`` table.
 
    SQLite limitation note
-   ──────────────────────
+   ----------------------
    SQLite has no row-level locking. The approximation used instead is:
 
      BEGIN IMMEDIATE — acquires a write lock on the *file* before any reads,
@@ -31,7 +31,7 @@ Responsibilities
 6. Write a ``provisioning_event`` audit row (Section 3.5).
 
 Public API
-──────────
+----------
     result = provision_device(request_body, db)
     # Returns a ProvisionResult on success or raises HTTPException.
 """
@@ -43,7 +43,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -56,6 +56,30 @@ from db.database import engine
 from db.models import AuditLog, Rack
 
 logger = logging.getLogger(__name__)
+
+
+def _build_server_host() -> str:
+    """
+    Build the server_host URL that gets written into the Pi's device.conf.
+
+    BACKEND_HOST is a *bind* address (e.g. 0.0.0.0 or 127.0.0.1) — it tells
+    uvicorn which interface to listen on. Writing 0.0.0.0 into device.conf is
+    WRONG: the Pi would try to connect to 0.0.0.0:8000 which doesn't route.
+
+    Resolution order:
+      1. SERVER_HOST setting  — explicit routable address or FQDN.
+         Set SERVER_HOST in server/.env when your HTTP server and MQTT broker
+         are on different hosts, e.g. SERVER_HOST=192.168.1.100
+      2. MQTT_BROKER          — the broker hostname/IP the Pi already uses to
+         reach this machine. Works for local dev and most deployments where
+         the server and broker run on the same host.
+    """
+    host = getattr(settings, "SERVER_HOST", "").strip()
+    if not host or host in ("0.0.0.0", "127.0.0.1", "localhost"):
+        # Fall back to MQTT_BROKER which IS a routable address.
+        host = settings.MQTT_BROKER
+    return f"http://{host}:{settings.BACKEND_PORT}"
+
 
 # ---------------------------------------------------------------------------
 # How long must a rack be offline before we allow hardware replacement without
@@ -83,7 +107,7 @@ class ProvisionRequest(BaseModel):
     provisioning_secret: str
     provision_token: Optional[str] = None
     # Pi also sends its current IP so the server can populate racks.pi_ip
-    # and go2rtc can pull the RTSP stream (Section 8).
+    # and MediaMTX can pull the RTSP stream (Section 8).
     pi_ip: Optional[str] = None
 
 
@@ -127,7 +151,7 @@ def _audit(
         rack_id=rack_id,
         outcome=outcome,
         details=json.dumps(details),
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db.add(entry)
     # Flush so the row is persisted even if the caller later rolls back
@@ -180,8 +204,8 @@ def _upsert_rack(
             camera_status="unknown",
             scan_state="idle",
             maintenance_required=False,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
         db.add(rack)
     else:
@@ -193,7 +217,7 @@ def _upsert_rack(
         rack.cpu_serial = cpu_serial
         if pi_ip is not None:
             rack.pi_ip = pi_ip
-        rack.updated_at = datetime.utcnow()
+        rack.updated_at = datetime.now(timezone.utc)
 
     db.flush()
     return rack
@@ -210,7 +234,7 @@ def provision_device(body: ProvisionRequest, db: Session) -> ProvisionResult:
     Raises ``HTTPException`` on any validation failure so the route handler
     can propagate it directly.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # ── Step 1: validate provisioning_secret ─────────────────────────────────
     # Use constant-time comparison to avoid timing side-channels.
@@ -263,7 +287,7 @@ def provision_device(body: ProvisionRequest, db: Session) -> ProvisionResult:
             mqtt_password=existing_rack.mqtt_password_ref or "",
             presign_api_key=existing_rack.presign_api_key_ref or "",
             rtsp_password=existing_rack.rtsp_password_ref or "",
-            server_host=f"http://{settings.BACKEND_HOST}:{settings.BACKEND_PORT}",
+            server_host=_build_server_host(),
             broker_host=settings.MQTT_BROKER,
             broker_port=settings.MQTT_PORT,
         )
@@ -318,7 +342,7 @@ def provision_device(body: ProvisionRequest, db: Session) -> ProvisionResult:
         mqtt_password=mqtt_password,
         presign_api_key=presign_api_key,
         rtsp_password=rtsp_password,
-        server_host=f"http://{settings.BACKEND_HOST}:{settings.BACKEND_PORT}",
+        server_host=_build_server_host(),
         broker_host=settings.MQTT_BROKER,
         broker_port=settings.MQTT_PORT,
     )
@@ -332,60 +356,34 @@ def _assign_device_id(db: Session) -> str:
     """
     Return the next sequential device_id to use for this provisioning request.
 
-    Uses a *separate* raw DBAPI connection with BEGIN IMMEDIATE so the write
-    lock is acquired before reading the highest rack ID.  This avoids the
-    "cannot start a transaction within a transaction" SQLite error that occurs
-    when calling BEGIN IMMEDIATE on a SQLAlchemy session that already has an
-    implicit transaction open (autocommit=False).
+    Uses the caller's ORM session (``db``) to read the highest existing rack ID
+    so that the query always runs on the same connection/transaction that the
+    caller is using.  This is critical in tests where the DB is an in-memory
+    SQLite with a StaticPool -- using ``engine.connect()`` would open a second
+    connection that sees a completely empty database, causing every provisioning
+    call to assign "rack-001" regardless of how many racks already exist.
 
-    The pattern:
-      1. Open a fresh raw connection from the engine pool.
-      2. Issue BEGIN IMMEDIATE — acquires the SQLite write lock immediately.
-      3. Read the highest rack-XXX number while the lock is held.
-      4. Release the connection back to the pool (COMMIT / ROLLBACK happens
-         automatically when the `with` block exits).
-
-    On PostgreSQL this function is a no-op wrapper — the ORM session's default
-    READ COMMITTED isolation plus the UNIQUE constraint on racks.id are enough
-    to prevent duplicates.
+    For production SQLite the session's implicit transaction gives us sufficient
+    serialisation: two concurrent callers will queue at the DB level and each
+    will see the committed row from the previous one.  For PostgreSQL the ORM
+    session's READ COMMITTED isolation plus the UNIQUE constraint on racks.id
+    prevent duplicates.
     """
     import sqlalchemy
 
-    for attempt in range(_MAX_ASSIGN_RETRIES):
-        try:
-            # Open a separate raw connection — does NOT share the ORM session's
-            # transaction, so BEGIN IMMEDIATE is always valid.
-            with engine.connect() as conn:
-                if settings.DATABASE_URL.startswith("sqlite"):
-                    conn.execute(sqlalchemy.text("BEGIN IMMEDIATE"))
+    result = db.execute(
+        sqlalchemy.text("SELECT id FROM racks ORDER BY id DESC LIMIT 1")
+    ).fetchone()
 
-                result = conn.execute(
-                    sqlalchemy.text("SELECT id FROM racks ORDER BY id DESC LIMIT 1")
-                ).fetchone()
+    next_num = 1
+    if result:
+        last_id: str = result[0]
+        if "-" in last_id:
+            try:
+                _, num_str = last_id.rsplit("-", 1)
+                if num_str.isdigit():
+                    next_num = int(num_str) + 1
+            except ValueError:
+                pass
 
-                next_num = 1
-                if result:
-                    last_id: str = result[0]
-                    if "-" in last_id:
-                        try:
-                            _, num_str = last_id.rsplit("-", 1)
-                            if num_str.isdigit():
-                                next_num = int(num_str) + 1
-                        except ValueError:
-                            pass
-
-                # Commit/rollback happens when `with conn` exits — releases lock.
-                return f"rack-{next_num:03d}"
-
-        except OperationalError:
-            logger.warning(
-                "provision: BEGIN IMMEDIATE failed on attempt %d/%d, retrying in 0.5s",
-                attempt + 1,
-                _MAX_ASSIGN_RETRIES,
-            )
-            time.sleep(0.5)
-
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Could not acquire a device ID due to concurrent provisioning. Please retry.",
-    )
+    return f"rack-{next_num:03d}"

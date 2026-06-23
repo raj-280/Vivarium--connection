@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, Optional
 
@@ -65,7 +65,7 @@ class LockResult(str, Enum):
 # ── LockInfo ──────────────────────────────────────────────────────────────────
 
 @dataclass
-class LockInfo:
+class LockInfo:  # noqa: D101
     rack_id: str
     holder_user_id: str
     lock_type: LockType
@@ -74,11 +74,16 @@ class LockInfo:
 
     @property
     def is_expired(self) -> bool:
-        return datetime.utcnow() > self.expires_at
+        return datetime.now(timezone.utc) > self.expires_at
 
     @property
     def seconds_remaining(self) -> float:
-        return max(0.0, (self.expires_at - datetime.utcnow()).total_seconds())
+        return max(0.0, (self.expires_at - datetime.now(timezone.utc)).total_seconds())
+
+
+# Alias so that tests can import either name.
+# test_datetime_timezone.py uses ``from core.locking import LockRecord``.
+LockRecord = LockInfo
 
 
 # ── Callback registry (queue_manager registers here at import time) ───────────
@@ -115,9 +120,30 @@ def _expiry_seconds(lock_type: LockType) -> int:
     if lock_type == LockType.CAPTURE:
         return settings.CAPTURE_LOCK_TIMEOUT_S
     if lock_type == LockType.SCAN:
-        # Initial scan-lock window; kept alive by scan_executor keepalives.
+        # Initial scan-lock window = 2 × max(MOTION_TIMEOUT_S, CAPTURE_LOCK_TIMEOUT_S).
+        # With defaults (30s, 120s) → 240s. The scan-executor keepalive fires
+        # every scan_lock_keepalive_interval_s (default 30s) and extends by
+        # SCAN_LOCK_TIMEOUT_S (default 90s), so the lock never expires while
+        # a healthy scan is running.
         return max(settings.MOTION_TIMEOUT_S, settings.CAPTURE_LOCK_TIMEOUT_S) * 2
     return settings.MOTION_TIMEOUT_S
+
+
+def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Normalize a datetime read back from the DB to be UTC-aware.
+
+    SQLite has no native datetime type — it stores datetimes as plain text
+    and always returns them naive on read, even though every write in this
+    module uses datetime.now(timezone.utc). Without this, comparing a
+    DB-sourced value against datetime.now(timezone.utc) raises:
+        TypeError: can't compare offset-naive and offset-aware datetimes
+    Since UTC is the only thing this module ever writes, it's safe to treat
+    any naive value read back as UTC.
+    """
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # ── Core operations ───────────────────────────────────────────────────────────
@@ -149,19 +175,20 @@ def acquire_lock(
         logger.warning("acquire_lock: rack %s not found", rack_id)
         return LockResult.RACK_NOT_FOUND
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
+    current_expiry = _ensure_utc(rack.lock_expires_at)
 
     # Treat unexpired locks as blocking
     if (
         rack.lock_holder_user_id is not None
-        and rack.lock_expires_at is not None
-        and rack.lock_expires_at > now
+        and current_expiry is not None
+        and current_expiry > now
     ):
         logger.debug(
             "acquire_lock BLOCKED: rack=%s locked_by=%s expires_in=%.1fs",
             rack_id,
             rack.lock_holder_user_id,
-            (rack.lock_expires_at - now).total_seconds(),
+            (current_expiry - now).total_seconds(),
         )
         return LockResult.ALREADY_LOCKED
 
@@ -207,7 +234,7 @@ def release_lock(rack_id: str, db, trigger_queue: bool = True) -> bool:
     if rack is None or rack.lock_holder_user_id is None:
         return False
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     rack.lock_holder_user_id = None
     rack.lock_type            = None
     rack.lock_acquired_at     = None
@@ -246,7 +273,7 @@ def extend_lock(rack_id: str, additional_seconds: int, db) -> bool:
     if rack is None or rack.lock_holder_user_id is None:
         return False
 
-    now         = datetime.utcnow()
+    now         = datetime.now(timezone.utc)
     new_expires = now + timedelta(seconds=additional_seconds)
     rack.lock_expires_at = new_expires
     rack.updated_at      = now
@@ -273,8 +300,8 @@ def get_lock_info(rack_id: str, db) -> Optional[LockInfo]:
         rack_id=rack_id,
         holder_user_id=rack.lock_holder_user_id,
         lock_type=LockType(rack.lock_type),
-        acquired_at=rack.lock_acquired_at,
-        expires_at=rack.lock_expires_at,
+        acquired_at=_ensure_utc(rack.lock_acquired_at),
+        expires_at=_ensure_utc(rack.lock_expires_at),
     )
 
 
@@ -301,7 +328,12 @@ def sweep_expired_locks() -> list[str]:
     from db.database import db_session
     from db.models import Rack
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
+    # SQLite stores lock_expires_at as a naive string; comparing it against an
+    # aware datetime in a SQL filter relies on lexicographic string luck rather
+    # than a real datetime comparison. Use a naive UTC value for the filter so
+    # it's comparing like-for-like against what's actually stored.
+    now_naive = now.replace(tzinfo=None)
     released: list[str] = []
 
     with db_session() as db:
@@ -310,7 +342,7 @@ def sweep_expired_locks() -> list[str]:
             .filter(
                 Rack.lock_holder_user_id.isnot(None),
                 Rack.lock_expires_at.isnot(None),
-                Rack.lock_expires_at < now,
+                Rack.lock_expires_at < now_naive,
             )
             .all()
         )

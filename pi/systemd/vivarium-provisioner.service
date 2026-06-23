@@ -1,25 +1,54 @@
 # =============================================================================
-# vivarium-provisioner.service (Section 5.1 / 5.3)
+# vivarium-provisioner.service
 # =============================================================================
-# Pre-start unit: runs provisioner.py, which exits immediately (milliseconds)
-# if /etc/gantry/device.conf already exists. Only does real work on first boot.
+# First-boot provisioner. Runs provisioner.py once and exits.
+# On every subsequent boot it exits immediately (idempotent — provisioner.py
+# checks if /etc/vivarium/device.conf already exists and returns 0 if it does).
 #
-# provisioner.py itself is implemented in Stage 8 — this unit file is created
-# now to match the Section 5.1 folder structure, but is not enabled/started
-# until Stage 8.
+# Runs BEFORE vivarium-bridge.service and vivarium-camera.service.
 # =============================================================================
 
 [Unit]
 Description=Vivarium Gantry — First-boot provisioner
-Before=vivarium-bridge.service
-ConditionPathExists=!/etc/gantry/device.conf
+# Must complete before the bridge or camera service start.
+Before=vivarium-bridge.service vivarium-camera.service
+# Skip this unit on every boot after the first successful provisioning run.
+# device.conf lives in /etc/vivarium/ — permanent, never deleted by deploys.
+ConditionPathExists=!/etc/vivarium/device.conf
 
 [Service]
 Type=oneshot
-User=gantry
-WorkingDirectory=/opt/vivarium/pi
-ExecStart=/usr/bin/python3 /opt/vivarium/pi/provisioner.py
+# Provisioner intentionally runs as root — it must create /etc/vivarium/
+# (mode 750) and write device.conf (mode 600) into it.  After writing it
+# chowns both the directory and device.conf to {{SERVICE_USER}}:{{SERVICE_GROUP}}
+# (read from GANTRY_SERVICE_USER in provisioner.env) so the bridge service,
+# which runs as {{SERVICE_USER}}, can read the file without elevated privileges.
+# The {{SERVICE_USER}} placeholder is NOT substituted here — root is always
+# correct for this unit.
+User=root
+Group=root
+WorkingDirectory={{INSTALL_DIR}}
+
+# provisioner.env is written by setup.sh with the env vars provisioner.py needs:
+#   GANTRY_SERVER_URL          — POST /provision target
+#   GANTRY_PROVISIONING_SECRET — authentication secret
+#   GANTRY_MQTT_BROKER         — written to device.conf [mqtt] broker_host
+#   GANTRY_SERVICE_USER        — chown target for device.conf and mediamtx.yaml
+#
+# setup.sh deletes this file after provisioning succeeds.
+# The leading "-" makes it optional — on every boot after the first the file
+# is absent and ConditionPathExists above prevents the unit from running anyway.
+# To re-provision: run setup.sh again (it will re-create provisioner.env).
+EnvironmentFile=-{{INSTALL_DIR}}/provisioner.env
+
+ExecStart=/usr/bin/python3 {{INSTALL_DIR}}/provisioner.py
+
+# Keep the unit "active" after exit so vivarium-bridge.service's Requires= is
+# satisfied on subsequent boots (where the unit is a ConditionPathExists no-op).
 RemainAfterExit=true
+
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

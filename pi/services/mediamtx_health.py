@@ -1,10 +1,10 @@
 """
-pi/services/go2rtc_health.py
+pi/services/mediamtx_health.py
 
-go2rtc health-check agent — Section 5.6.
+MediaMTX health-check agent — Section 5.6.
 
-Periodically checks whether the go2rtc process is running and the configured
-stream is reachable, then reports camera_status in the bridge heartbeat.
+Periodically checks whether the MediaMTX process is running and the configured
+stream path is reachable, then reports camera_status in the bridge heartbeat.
 
 Two check strategies are available:
 
@@ -12,25 +12,23 @@ Two check strategies are available:
      `systemctl is-active vivarium-camera` — checks the systemd unit state.
      Returns "active" when healthy, anything else when not.
 
-  2. go2rtc HTTP API (fallback and for local testing without systemd):
-     GET http://127.0.0.1:1984/api/streams  (from go2rtc.example.yaml [api])
-     Checks that the response is 200 AND the expected stream name is present
-     in the JSON. This works on any OS, including Windows/macOS for dev/CI.
+  2. MediaMTX HTTP API (fallback and for local testing without systemd):
+     GET http://127.0.0.1:9997/v3/paths/list
+     Checks that the response is 200 AND the expected path name is present
+     in the JSON. Works on any OS including Windows/macOS for dev/CI.
 
 Strategy selection (in priority order):
   a. GANTRY_CAMERA_HEALTH_STRATEGY env var: "systemctl" | "api" | "auto"
   b. "auto" (default): try systemctl first; if systemd is not available or
      the unit doesn't exist, fall back to the HTTP API check.
 
-For local testing without a real go2rtc instance running:
+For local testing without a real MediaMTX instance running:
   - Set GANTRY_MOCK_CAMERA=1 (same env var used by camera_handler.py).
-    go2rtc_health always reports "online" and skips both checks.
+    mediamtx_health always reports "online" and skips both checks.
 
 Usage from bridge.py heartbeat:
-    from services.go2rtc_health import go2rtc_health
-    camera_status = go2rtc_health.check()   # returns "online" | "offline"
-
-The Bridge._publish_heartbeat() method is updated in this stage to call this.
+    from services.mediamtx_health import mediamtx_health
+    camera_status = mediamtx_health.check()   # returns "online" | "offline"
 """
 
 from __future__ import annotations
@@ -59,32 +57,29 @@ HealthStrategy = Literal["systemctl", "api", "auto"]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Name of the go2rtc systemd unit (must match the .service file name)
+# Name of the MediaMTX systemd unit (matches vivarium-camera.service)
 _SYSTEMD_UNIT = "vivarium-camera.service"
 
-# go2rtc HTTP API base URL — from go2rtc.example.yaml [api] listen address
-# and pi/config/settings.py (no dedicated setting key yet; hard-coded to the
-# documented default of 127.0.0.1:1984).  If you change the port in the YAML,
-# update this constant to match.
-_GO2RTC_API_BASE = "http://127.0.0.1:1984"
+# MediaMTX REST API base URL — bound to localhost only (see mediamtx.example.yaml)
+_MEDIAMTX_API_BASE = "http://127.0.0.1:9997"
 
 # Timeout for the HTTP API check (seconds)
 _HTTP_TIMEOUT_S = 3
 
-# How often to re-check camera health when running the background thread
+# How often to re-check camera health in the background polling thread
 _DEFAULT_POLL_INTERVAL_S = 30.0
 
 
-class Go2RTCHealth:
+class MediaMTXHealth:
     """
-    Singleton health-check service for the go2rtc streaming agent.
+    Singleton health-check service for the MediaMTX streaming agent.
 
     Usage (bridge.py):
-        from services.go2rtc_health import go2rtc_health
+        from services.mediamtx_health import mediamtx_health
         # One-shot check (called from heartbeat)
-        status = go2rtc_health.check()
+        status = mediamtx_health.check()
         # Start a background polling thread (optional)
-        go2rtc_health.start_background_polling()
+        mediamtx_health.start_background_polling()
     """
 
     def __init__(self) -> None:
@@ -103,12 +98,12 @@ class Go2RTCHealth:
         Run a single health check and return the camera_status string.
 
         Returns:
-            "online"  — go2rtc is running and the stream is present
-            "offline" — go2rtc unit is not active or stream is absent
+            "online"  — MediaMTX is running and the stream path is present
+            "offline" — MediaMTX unit is not active or path is absent
             "unknown" — check could not be performed (no systemd, API not up)
 
-        This method is synchronous and safe to call from any thread.
-        It updates the cached status returned by last_status.
+        Synchronous and safe to call from any thread.
+        Updates the cached status returned by last_status.
         """
         if self._mock:
             return self._set("online")
@@ -150,12 +145,12 @@ class Go2RTCHealth:
         self._poll_thread = threading.Thread(
             target=self._poll_loop,
             args=(interval_s,),
-            name="go2rtc-health",
+            name="mediamtx-health",
             daemon=True,
         )
         self._poll_thread.start()
         logger.info(
-            "go2rtc health polling started (strategy=%s interval=%.0fs)",
+            "MediaMTX health polling started (strategy=%s interval=%.0fs)",
             self._strategy, interval_s,
         )
 
@@ -176,9 +171,9 @@ class Go2RTCHealth:
             try:
                 self.check()
             except Exception:
-                logger.exception("go2rtc health check error")
+                logger.exception("MediaMTX health check error")
             self._stop_event.wait(interval_s)
-        logger.info("go2rtc health polling stopped.")
+        logger.info("MediaMTX health polling stopped.")
 
     # ── Strategy 1: systemctl ─────────────────────────────────────────────────
 
@@ -187,9 +182,8 @@ class Go2RTCHealth:
         Check the vivarium-camera.service unit state using
         `systemctl is-active <unit>`.
 
-        Returns "online" if the unit reports "active", "offline" if it reports
-        anything else (failed, inactive, activating, etc.), or "unknown" if
-        systemctl is not available (non-Linux / non-systemd environment).
+        Returns "online" if active, "offline" if failed/inactive,
+        "unknown" if systemctl is not available (non-systemd environment).
         """
         try:
             result = subprocess.run(
@@ -204,7 +198,7 @@ class Go2RTCHealth:
             return self._set(status)
 
         except FileNotFoundError:
-            # systemctl not found — not a systemd system (macOS, Windows, WSL2 dev)
+            # systemctl not found — not a systemd system (macOS, Windows, dev)
             logger.debug("systemctl not found — falling back to API check")
             return self._set("unknown")
         except subprocess.TimeoutExpired:
@@ -214,63 +208,83 @@ class Go2RTCHealth:
             logger.warning("systemctl check failed: %s", exc)
             return self._set("unknown")
 
-    # ── Strategy 2: go2rtc HTTP API ───────────────────────────────────────────
+    # ── Strategy 2: MediaMTX HTTP API ─────────────────────────────────────────
 
     def _check_api(self) -> CameraStatus:
         """
-        Check the go2rtc HTTP API at GET /api/streams.
+        Check the MediaMTX REST API at GET /v3/paths/list.
 
-        The response is a JSON object whose keys are stream names.
+        The response is a JSON object:
+            { "items": [ {"name": "...", "ready": true/false, ...}, ... ] }
+
         Checks that:
           1. The request returns HTTP 200.
-          2. The stream name matching settings.go2rtc_stream_name is present.
+          2. The path name matching settings.stream_name is present.
+          3. The path's 'ready' flag is True.
 
-        Falls back to "unknown" if the API is not reachable.
-        Falls back gracefully to checking any stream is present if
-        settings.go2rtc_stream_name is not configured.
+        BUG FIX: Previously only the path name was checked (#1 and #2 above).
+        With sourceOnDemand:true in mediamtx.yaml, MediaMTX registers the
+        path immediately at startup but leaves ready=false until someone
+        actually starts watching. This means the old code reported
+        camera_status='online' even when the camera ribbon cable was
+        completely unplugged — the crash only surfaced when a user opened
+        the stream. We now require ready=true, which MediaMTX only sets once
+        the camera hardware has been opened successfully.
         """
         try:
-            import urllib.request  # stdlib — no extra dependency
+            import urllib.request
             import json as _json
 
-            url = f"{_GO2RTC_API_BASE}/api/streams"
+            url = f"{_MEDIAMTX_API_BASE}/v3/paths/list"
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
                 if resp.status != 200:
-                    logger.debug("go2rtc API returned HTTP %d", resp.status)
+                    logger.debug("MediaMTX API returned HTTP %d", resp.status)
                     return self._set("offline")
 
                 body = _json.loads(resp.read().decode())
 
-            # body is a dict: { "<stream_name>": { ... }, ... }
-            expected_stream = settings.go2rtc_stream_name or settings.device_id
-            if not isinstance(body, dict):
-                logger.debug("go2rtc /api/streams returned unexpected type: %r", type(body))
-                return self._set("unknown")
+            # body: { "itemCount": N, "pageCount": N, "items": [{"name": "...", "ready": bool}, ...] }
+            items = body.get("items", [])
+            expected = settings.stream_name or settings.device_id
 
-            if expected_stream and expected_stream in body:
-                logger.debug("go2rtc API: stream %r present → online", expected_stream)
-                return self._set("online")
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("name", "") == expected:
+                    # BUG FIX: check 'ready', not just presence.
+                    # ready=false means path is configured but camera hardware
+                    # has not been opened yet (sourceOnDemand=true and no
+                    # active viewer, or the camera failed to initialise).
+                    ready = item.get("ready", False)
+                    if ready:
+                        logger.debug("MediaMTX API: path %r ready=True → online", expected)
+                        return self._set("online")
+                    else:
+                        logger.debug(
+                            "MediaMTX API: path %r present but ready=False → offline "
+                            "(sourceOnDemand: camera not yet open, or hardware error)",
+                            expected,
+                        )
+                        return self._set("offline")
 
-            # If stream name not configured or missing, any non-empty response
-            # means go2rtc is alive (though not necessarily streaming our rack)
-            if body:
+            # Path not found at all
+            path_names = [i.get("name") for i in items if isinstance(i, dict)]
+            if path_names:
                 logger.debug(
-                    "go2rtc API: stream %r not found in %s, but API alive",
-                    expected_stream, list(body.keys()),
+                    "MediaMTX API: path %r not found in %s → offline",
+                    expected, path_names,
                 )
-                return self._set("offline")
-
-            # Empty stream dict — go2rtc running but no streams configured
-            logger.debug("go2rtc API: running but no streams configured")
+            else:
+                logger.debug("MediaMTX API: running but no paths configured")
             return self._set("offline")
 
         except OSError as exc:
-            # Connection refused / timeout — go2rtc not running
-            logger.debug("go2rtc API not reachable: %s", exc)
+            # Connection refused / timeout — MediaMTX not running
+            logger.debug("MediaMTX API not reachable: %s", exc)
             return self._set("offline")
         except Exception as exc:
-            logger.warning("go2rtc API check error: %s", exc)
+            logger.warning("MediaMTX API check error: %s", exc)
             return self._set("unknown")
 
     # ── Strategy resolution ───────────────────────────────────────────────────
@@ -283,7 +297,7 @@ class Go2RTCHealth:
 
         Values:
           "systemctl"  — use systemctl is-active only
-          "api"        — use go2rtc HTTP API only
+          "api"        — use MediaMTX HTTP API only
           "auto"       — try systemctl; fall back to API (default)
         """
         raw = os.environ.get("GANTRY_CAMERA_HEALTH_STRATEGY", "auto").lower().strip()
@@ -296,5 +310,5 @@ class Go2RTCHealth:
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────
-# bridge.py imports this:  from services.go2rtc_health import go2rtc_health
-go2rtc_health = Go2RTCHealth()
+# bridge.py imports:  from services.mediamtx_health import mediamtx_health
+mediamtx_health = MediaMTXHealth()

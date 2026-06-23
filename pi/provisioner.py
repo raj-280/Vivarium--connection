@@ -5,44 +5,34 @@ First-boot identity flow — Section 5.3.
 
 Responsibilities
 ────────────────
-1. Check if /etc/gantry/device.conf (or GANTRY_DEVICE_CONF override) exists.
-   If it does, exit immediately (milliseconds) — the bridge starts normally.
-   This makes the vivarium-provisioner.service safe to run on every boot; it is
-   a no-op after the first successful provisioning.
+1. Check if pi/config/device.conf already exists.
+   If it does, exit immediately — the bridge can start normally.
+   Safe to run on every boot; it is a no-op after successful provisioning.
 
 2. Read the CPU serial from /proc/cpuinfo.
-   For local testing (no real Pi hardware), set the environment variable:
+   For local testing (no real Pi hardware), set:
        GANTRY_MOCK_CPU_SERIAL=MOCK000000000001
-   and any string is accepted instead.  Never set this on a real Pi.
+   Never set this on a real Pi.
 
-3. Read the provisioning secret and (optional) provision token from disk/env.
-   Baked into the SD card image at image-build time.  After provisioning they
-   are deleted from disk so they can never be read again.
-
-   Look-up order (either mechanism is fine):
-     a. File:  GANTRY_PROVISIONING_SECRET_FILE (path) → read content, strip.
-     b. Env:   GANTRY_PROVISIONING_SECRET (value, for Docker/local dev).
-
-   Token (optional, pre-assigned flow):
-     a. File:  GANTRY_PROVISION_TOKEN_FILE (path) → read content, strip.
-     b. Env:   GANTRY_PROVISION_TOKEN (value).
+3. Read the provisioning secret and optional token from disk or env:
+     Secret — GANTRY_PROVISIONING_SECRET_FILE (file path) or
+              GANTRY_PROVISIONING_SECRET     (plain env var)
+     Token  — GANTRY_PROVISION_TOKEN_FILE    (file path) or
+              GANTRY_PROVISION_TOKEN         (plain env var)
 
 4. POST {cpu_serial, provisioning_secret, provision_token?, pi_ip?} to
    {GANTRY_SERVER_URL}/provision (default http://localhost:8000).
 
-5. Write the returned credentials into device.conf at mode 0o600.
-   Path is GANTRY_DEVICE_CONF env var (default /etc/gantry/device.conf).
-   Parent directory is created if it doesn't exist.
+5. Write the returned credentials into pi/config/device.conf (mode 0o600).
+   This is the SAME file that pi/config/settings.py reads — no path config
+   needed on either side.
 
-6. Delete the provisioning_secret file and provision_token file (if they
-   were read from a file path) so they cannot be read after provisioning.
-   Env-var-supplied secrets are gone as soon as the process exits.
+6. Delete the provisioning_secret/token files from disk after success.
 
 Exit codes
 ──────────
 0 — provisioning complete (or device.conf already existed — no-op).
-1 — unrecoverable error (bad secret, network failure, no pool IDs left, etc.)
-    Details are logged; the systemd unit will log them to the journal.
+1 — unrecoverable error (bad secret, network failure, no pool IDs left).
 """
 
 from __future__ import annotations
@@ -71,31 +61,41 @@ logging.basicConfig(
 logger = logging.getLogger("provisioner")
 
 # ---------------------------------------------------------------------------
-# Constants driven by environment variables — no hardcoded values (Section 2)
+# Constants
 # ---------------------------------------------------------------------------
 
-# Where to write device.conf — mirrors pi/config/settings.py resolution order
-DEVICE_CONF_PATH: str = os.environ.get("GANTRY_DEVICE_CONF", "/etc/gantry/device.conf")
+# device.conf is written to /etc/vivarium/device.conf — a permanent system
+# path that survives git pulls, redeployments, and OS upgrades.  The /etc/
+# location is owned root:pi (mode 750 for the directory, 600 for the file)
+# so only the bridge/provisioner running as the pi user can read it, and no
+# code update can accidentally overwrite or delete it.
+#
+# pi/config/settings.py reads from the same path.
+DEVICE_CONF_PATH: Path = Path("/etc/vivarium/device.conf")
 
-# Server base URL — provisioner runs before the Pi has device.conf, so it
-# reads from the environment, not from settings.py (which requires device.conf).
+# Server base URL — provisioner runs before device.conf exists, so it reads
+# from an env var rather than settings.py.
 SERVER_URL: str = os.environ.get("GANTRY_SERVER_URL", "http://localhost:8000").rstrip("/")
 
-# Mock CPU serial for local dev/CI (never set on a real Pi — see §5.3 note).
+# Mock CPU serial for local dev/CI (never set on a real Pi).
 MOCK_CPU_SERIAL: Optional[str] = os.environ.get("GANTRY_MOCK_CPU_SERIAL")
 
-# Secret / token — file paths (preferred, mirrors SD-card image convention) or
-# plain env vars (convenient for Docker/local tests).
+# Secret / token — file paths (preferred) or plain env vars (Docker/local).
 PROVISIONING_SECRET_FILE: Optional[str] = os.environ.get("GANTRY_PROVISIONING_SECRET_FILE")
 PROVISIONING_SECRET_ENV: Optional[str] = os.environ.get("GANTRY_PROVISIONING_SECRET")
 
 PROVISION_TOKEN_FILE: Optional[str] = os.environ.get("GANTRY_PROVISION_TOKEN_FILE")
 PROVISION_TOKEN_ENV: Optional[str] = os.environ.get("GANTRY_PROVISION_TOKEN")
 
-# Retry config for the /provision HTTP call (transient network issues on first boot)
+# Retry config for the /provision HTTP call
 HTTP_TIMEOUT_S: int = int(os.environ.get("GANTRY_PROVISION_TIMEOUT_S", "30"))
 HTTP_MAX_RETRIES: int = int(os.environ.get("GANTRY_PROVISION_RETRIES", "5"))
 HTTP_RETRY_DELAY_S: float = float(os.environ.get("GANTRY_PROVISION_RETRY_DELAY_S", "10"))
+
+# Single source of truth for the MediaMTX RTSP port.
+# Written to BOTH device.conf [streaming] mediamtx_port AND mediamtx.yaml
+# rtspAddress — changing this one constant keeps both files in sync.
+_MEDIAMTX_DEFAULT_PORT: str = "8554"
 
 
 # ===========================================================================
@@ -103,8 +103,8 @@ HTTP_RETRY_DELAY_S: float = float(os.environ.get("GANTRY_PROVISION_RETRY_DELAY_S
 # ===========================================================================
 
 def _already_provisioned() -> bool:
-    """Return True if device.conf exists at the configured path."""
-    return Path(DEVICE_CONF_PATH).is_file()
+    """Return True if pi/config/device.conf already exists."""
+    return DEVICE_CONF_PATH.is_file()
 
 
 # ===========================================================================
@@ -319,29 +319,37 @@ def _post_provision(
 
 def _write_device_conf(data: dict) -> None:
     """
-    Write the credentials returned by /provision into device.conf.
+    Write the credentials returned by /provision into pi/config/device.conf.
 
-    The file follows the INI sections defined in Section 2.2 exactly:
-      [identity], [server], [mqtt], [serial], [capture], [streaming], [scan]
-
-    Static defaults (serial, capture, streaming, scan) are written from the
-    built-in fallback values in pi/config/settings.py so the bridge can start
-    immediately after provisioning without any further hand-editing.
+    This is the SAME file that pi/config/settings.py reads — the provisioner
+    and settings.py both derive the path from __file__ so they always agree
+    without any environment variable or hardcoded system path.
 
     File permissions: 0o600 (owner read/write only).
-    Parent directory is created with 0o700 if it doesn't exist.
+    Parent directory (pi/config/) is created if it does not exist.
     """
     device_id: str = data["device_id"]
-    conf_path = Path(DEVICE_CONF_PATH)
+    conf_path: Path = DEVICE_CONF_PATH
 
-    # Create parent directory if missing (e.g. /etc/gantry/)
-    conf_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Create /etc/vivarium/ if it does not exist yet.
+    # Permissions: 750 (root owns it, pi group can read/enter, world cannot).
+    # The provisioner runs as root (via sudo / setup.sh), so we set the group
+    # to "pi" explicitly so that the bridge service (User=pi) can read the dir.
+    conf_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    try:
+        import shutil, grp
+        pi_gid = grp.getgrnam("pi").gr_gid
+        shutil.chown(conf_path.parent, user="root", group="pi")
+        conf_path.parent.chmod(0o750)
+    except (KeyError, PermissionError, AttributeError):
+        # On a dev machine or in CI there is no "pi" group — skip chown.
+        pass
 
     parser = configparser.ConfigParser()
 
     # ── [identity] ─────────────────────────────────────────────────────────
-    # cpu_serial is intentionally LEFT BLANK per Section 2.2:
-    # "cpu_serial (read-only, not stored after provisioning)"
+    # cpu_serial is left blank — read from /proc/cpuinfo during provisioning
+    # only; not stored here afterwards (Section 2.2).
     parser["identity"] = {
         "device_id": device_id,
         "cpu_serial": "",
@@ -356,40 +364,54 @@ def _write_device_conf(data: dict) -> None:
     }
 
     # ── [mqtt] ──────────────────────────────────────────────────────────────
+    # broker_host priority: server response → GANTRY_MQTT_BROKER env var
+    # (set by setup.sh) → "localhost" last-resort default.
+    # setup.sh exports GANTRY_MQTT_BROKER so that even if the server omits
+    # broker_host from its /provision response, device.conf gets the correct
+    # host that the operator typed in during setup rather than "localhost".
+    _broker_host: str = (
+        data.get("broker_host")
+        or os.environ.get("GANTRY_MQTT_BROKER")
+        or "localhost"
+    )
     parser["mqtt"] = {
-        "broker_host": data.get("broker_host", "localhost"),
+        "broker_host": _broker_host,
         "broker_port": str(data.get("broker_port", 1883)),
-        # [PROD ONLY] — inert locally; flip via Ansible when hardening (§9)
+        # [PROD ONLY] — flip via Ansible when hardening (Section 9)
         "mqtt_use_tls": "false",
         "ca_cert_path": "",
     }
 
     # ── [serial] ────────────────────────────────────────────────────────────
-    # Defaults from Section 2.2; operator edits these in place if hardware
-    # differs (e.g. different port on a custom carrier board).
+    # "auto" tells SerialHandler to scan /dev/ttyACM* and /dev/ttyUSB* and
+    # use the first Arduino it finds — no need to know the port in advance.
+    # Change to a fixed port (e.g. /dev/ttyACM0) only if you have multiple
+    # serial devices and need to pin the Arduino to a specific one.
     parser["serial"] = {
-        "serial_port": "/dev/ttyACM0",
+        "serial_port": "auto",
         "serial_baud": "115200",
-        "serial_timeout_s": "5",
+        # 10 s: enough for slow firmware responses without hanging forever.
+        "serial_timeout_s": "10",
         "serial_retry_count": "1",
     }
 
     # ── [capture] ───────────────────────────────────────────────────────────
-    # S3 upload stays dormant until BOTH batch_upload_enabled=true here AND
-    # S3_ENABLED=true on the server (Section 5.4 / 12).
+    # Pi-local capture directory. S3 upload stays off until both this flag
+    # AND S3_ENABLED on the server are true (Section 5.4 / 12).
     parser["capture"] = {
         "capture_dir": f"/var/vivarium/{device_id}/captures",
         "batch_upload_enabled": "false",
-        # true on a real Pi (/tmp is RAM-backed tmpfs); false by default so
-        # the provisioner doesn't assume it's running on the actual hardware.
+        # true on a real Pi (/tmp is RAM-backed tmpfs); false for local dev.
         "tmp_is_tmpfs": "false",
     }
 
-    # ── [streaming] ─────────────────────────────────────────────────────────
-    # Stream name always matches device_id (Section 2.2 / 5.6).
+    # -- [streaming] ---------------------------------------------------------
+    # mediamtx_port uses _MEDIAMTX_DEFAULT_PORT — the single constant shared
+    # with _write_mediamtx_yaml() so both files always carry the same port.
+    # Stream path name always matches device_id (Section 2.2 / 5.6).
     parser["streaming"] = {
-        "go2rtc_port": "8554",
-        "go2rtc_stream_name": device_id,
+        "mediamtx_port": _MEDIAMTX_DEFAULT_PORT,
+        "stream_name": device_id,
     }
 
     # ── [scan] ──────────────────────────────────────────────────────────────
@@ -397,16 +419,79 @@ def _write_device_conf(data: dict) -> None:
         "scan_lock_keepalive_interval_s": "30",
     }
 
-    # Write atomically: write to a temp file then rename (POSIX atomic).
+    # Write atomically: temp file → chmod 600 → rename (POSIX atomic swap).
     tmp_path = conf_path.with_suffix(".tmp")
     with tmp_path.open("w") as fh:
         parser.write(fh)
 
-    # Set 600 before rename so there's no window where the file is world-readable
+    # Set 600 before rename so there is no window where the file is world-readable.
     tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     tmp_path.rename(conf_path)
 
+    # Fix ownership: provisioner runs as root, but vivarium-bridge.service
+    # runs as User=pi.  Ensure pi can read device.conf.
+    try:
+        import shutil as _shutil
+        _shutil.chown(conf_path, user="pi", group="pi")
+        logger.info("device.conf ownership set to pi:pi")
+    except (PermissionError, KeyError, AttributeError):
+        logger.debug("Could not chown device.conf to pi:pi (dev machine — skipping)")
+
     logger.info("device.conf written to %s (mode 600)", conf_path)
+
+
+# ===========================================================================
+# Step 5b -- Write mediamtx.yaml from template
+# ===========================================================================
+
+def _write_mediamtx_yaml(
+    device_id: str,
+    rtsp_password: str,
+    mediamtx_port: str = _MEDIAMTX_DEFAULT_PORT,
+) -> None:
+    """
+    Generate pi/mediamtx/mediamtx.yaml by substituting placeholders in
+    pi/mediamtx/mediamtx.example.yaml.
+
+    Placeholders substituted:
+        {{DEVICE_ID}}      -- this Pi's device_id
+        {{RTSP_PASSWORD}}  -- issued by POST /provision
+        {{MEDIAMTX_PORT}}  -- RTSP listen port (default _MEDIAMTX_DEFAULT_PORT)
+
+    The output file is written mode 600 (contains rtsp_password).
+    """
+    template_path = Path(__file__).parent / "mediamtx" / "mediamtx.example.yaml"
+    output_path   = Path(__file__).parent / "mediamtx" / "mediamtx.yaml"
+
+    if not template_path.is_file():
+        logger.warning(
+            "mediamtx.example.yaml not found at %s -- skipping mediamtx.yaml generation.",
+            template_path,
+        )
+        return
+
+    content = template_path.read_text(encoding="utf-8")
+    content = content.replace("{{DEVICE_ID}}",     device_id)
+    content = content.replace("{{RTSP_PASSWORD}}", rtsp_password)
+    content = content.replace("{{MEDIAMTX_PORT}}", mediamtx_port)
+
+    tmp_path = output_path.with_suffix(".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600 -- contains RTSP password
+    tmp_path.rename(output_path)
+
+    # Fix ownership: provisioner runs as root (via setup.sh sudo) but
+    # vivarium-camera.service runs as User=pi.  Without chown the file is
+    # root:root 600 and mediamtx gets "permission denied" on open().
+    try:
+        import shutil as _shutil
+        _shutil.chown(output_path, user="pi", group="pi")
+        logger.info("mediamtx.yaml ownership set to pi:pi")
+    except (PermissionError, KeyError, AttributeError):
+        # Dev machine / CI — no "pi" user; skip gracefully.
+        logger.debug("Could not chown mediamtx.yaml to pi:pi (dev machine — skipping)")
+
+    logger.info("mediamtx.yaml written to %s (mode 600)", output_path)
 
 
 # ===========================================================================
@@ -454,6 +539,7 @@ def main() -> None:
         "No device.conf found at %s — starting first-boot provisioning.",
         DEVICE_CONF_PATH,
     )
+    logger.info("Config will be written to: %s", DEVICE_CONF_PATH)
 
     # ── Step 2: read CPU serial ────────────────────────────────────────────
     try:
@@ -487,20 +573,44 @@ def main() -> None:
         logger.error("Provisioning failed: %s", exc)
         sys.exit(1)
 
-    # ── Step 5: write device.conf (mode 600) ──────────────────────────────
+    # ── Step 5: write device.conf (mode 600) to /etc/vivarium/device.conf ──
     try:
         _write_device_conf(result)
     except OSError as exc:
         logger.error(
-            "Failed to write device.conf to %s: %s\n"
-            "If running locally, set GANTRY_DEVICE_CONF to a writable path "
-            "(e.g. GANTRY_DEVICE_CONF=/tmp/device.conf).",
+            "Failed to write device.conf to %s: %s",
             DEVICE_CONF_PATH,
             exc,
         )
         sys.exit(1)
 
-    # ── Step 6: delete secret files from disk ─────────────────────────────
+    # -- Step 5b: write mediamtx.yaml from template --------------------------
+    # BUG-15 FIX: rtsp_password must be present; an empty password would leave
+    # the RTSP stream unauthenticated. KeyError propagates to the outer
+    # except RuntimeError block and exits with code 1.
+    try:
+        rtsp_password = result["rtsp_password"]
+        if not rtsp_password:
+            raise RuntimeError(
+                "Server returned an empty rtsp_password — cannot configure "
+                "MediaMTX without a password. Check server provisioning logic."
+            )
+    except KeyError:
+        raise RuntimeError(
+            "Server response missing 'rtsp_password' field — cannot configure "
+            "MediaMTX. Check server provisioning endpoint."
+        )
+
+    # Pass mediamtx_port explicitly from the shared constant — do not rely
+    # on the default parameter so that a future change to _MEDIAMTX_DEFAULT_PORT
+    # is immediately visible at the call site.
+    _write_mediamtx_yaml(
+        device_id=result.get("device_id", "rack-unknown"),
+        rtsp_password=rtsp_password,
+        mediamtx_port=_MEDIAMTX_DEFAULT_PORT,
+    )
+
+    # -- Step 6: delete secret files from disk --------------------------------
     _delete_secret_files(secret_file_path, token_file_path)
 
     logger.info(

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -141,7 +141,7 @@ class GantryState:
         Keyword arguments must match RackState field names.
         The derived `pi_online` flag is recalculated whenever `mqtt_status`
         is provided (or when a new entry is created).
-        `updated_at` is always set to datetime.utcnow() on every call.
+        `updated_at` is always set to datetime.now(timezone.utc) on every call.
 
         Example:
             gantry_state.upsert(
@@ -164,7 +164,7 @@ class GantryState:
 
             # Always refresh derived flag and timestamp
             state.pi_online = state.mqtt_status == "online"
-            state.updated_at = datetime.utcnow()
+            state.updated_at = datetime.now(timezone.utc)
             return state
 
     def remove(self, rack_id: str) -> None:

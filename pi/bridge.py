@@ -57,14 +57,14 @@ if __package__ in (None, ""):
     from services.mqtt_client import mqtt_client
     from services.serial_handler import SerialHandler
     from services.camera_handler import camera_handler       # Stage 9
-    from services.go2rtc_health import go2rtc_health         # Stage 10
+    from services.mediamtx_health import mediamtx_health       # Stage 10
     from services.scan_executor import ScanExecutor          # Stage 11
 else:
     from .config.settings import settings
     from .services.mqtt_client import mqtt_client
     from .services.serial_handler import SerialHandler
     from .services.camera_handler import camera_handler      # Stage 9
-    from .services.go2rtc_health import go2rtc_health        # Stage 10
+    from .services.mediamtx_health import mediamtx_health    # Stage 10
     from .services.scan_executor import ScanExecutor         # Stage 11
  
  
@@ -78,7 +78,31 @@ logger = logging.getLogger("bridge")
 # ── Constants ─────────────────────────────────────────────────────────────
  
 HEARTBEAT_INTERVAL_S = 30.0
- 
+
+# How long to wait after the M114 health-check round-trip before issuing the
+# M705/M706/M707 layout queries.
+#
+# Why this matters: the Arduino firmware sends "Yo! On my way!" immediately
+# after receiving any command line, BEFORE it processes or responds. This means
+# M114 produces two serial lines:
+#   1. "Yo! On my way!"   ← echo (filtered as noise by serial_handler)
+#   2. <real M114 response>  ← e.g. "X:0.00 Y:0.00 C:0.00 homed:X=N Y=N C=N"
+#
+# The noise filter in _write_and_wait() catches line 1 reliably. The risk is
+# line 2 (the real M114 response) arriving *after* health_check() has already
+# timed out AND after M705 has been written to the wire, so it lands inside
+# M705's response window. _write_and_wait() would accept it (not noise), but
+# the regex r'ROWS=(\d+)\s+COLS=(\d+)' won't match an M114 string, triggering:
+#   WARNING: _publish_layout_config: could not parse M705 response: 'X:0.00 ...'
+#
+# 0.3 s was too short on slow/loaded systems. 1.2 s covers:
+#   • USB CDC ACM re-enumeration jitter (~50 ms)
+#   • Arduino firmware processing time under interrupt load (~200 ms observed)
+#   • Two full serial_timeout_s windows would be overkill; 1.2 s is the
+#     measured 99th-percentile M114 round-trip on a Mega at 115200 baud + 20%
+#     margin. Adjust down if your hardware is consistently faster.
+_POST_M114_SETTLE_S: float = 1.2
+
 # Commands intercepted by the bridge — never forwarded to the Arduino.
 # Section 5.2 / 5.4 / 5.5 / Section 6 ("CAPTURE never reaches the Arduino").
 INTERCEPTED_COMMANDS = {"CAPTURE", "SCAN_START", "SCAN_STOP"}
@@ -106,9 +130,9 @@ class Bridge:
         # cleanup sequence runs on every (re)connect, including the first.
         self._first_connect_done = False
  
-        # Start go2rtc health polling in the background so heartbeats can
+        # Start MediaMTX health polling in the background so heartbeats can
         # read camera_status cheaply from the cache (Section 5.6 / Stage 10).
-        go2rtc_health.start_background_polling()
+        mediamtx_health.start_background_polling()
  
         # Scan executor — shares this bridge's serial port (Section 5.5).
         # One instance per Bridge; scan lock enforces a single active scan.
@@ -205,8 +229,8 @@ class Bridge:
         # 1. Arduino health check — health_check() now returns the raw M114
         # response string (or None on timeout) so we reuse it for the
         # homed-flag verify step below WITHOUT a second serial round-trip.
-        # Sending M114 twice in rapid succession caused the second “Yo! On my
-        # way!” echo to contaminate the response window of the first layout
+        # Sending M114 twice in rapid succession caused the second "Yo! On my
+        # way!" echo to contaminate the response window of the first layout
         # query (M705), producing spurious parse-warnings in the logs.
         m114_response: Optional[str] = None
         healthy = False
@@ -241,88 +265,144 @@ class Bridge:
         # 4. Publish BRIDGE_RECONNECTED
         mqtt_client.publish_response(f"BRIDGE_RECONNECTED:{which}")
         logger.info("Reconnect-cleanup sequence complete — published BRIDGE_RECONNECTED.")
- 
+
         # 5. Query layout + limits, publish LAYOUT_CONFIG.
-        # A brief pause gives the Arduino’s serial TX buffer time to flush any
-        # remaining bytes from the M114 round-trip above before we open the
-        # M705/M706/M707 response windows.  This prevents the M114 real-response
-        # line (arriving slightly late) from being swallowed by M705’s waiter
-        # before _waiting_for_response is set, and prevents the M705 “Yo!” echo
-        # from arriving AFTER the window opens and being routed as unsolicited.
-        time.sleep(0.3)
+        #
+        # Wait for the serial RX buffer to fully drain before opening the
+        # M705 response window. Two distinct cases need to be covered:
+        #
+        #   Case A — M114 responded within health_check()'s timeout:
+        #     Both "Yo!" and the real M114 line have already been consumed by
+        #     _write_and_wait(). Nothing stale remains. A short pause (≥ one
+        #     USB poll cycle, ~10 ms) is sufficient, but we use _POST_M114_SETTLE_S
+        #     as a conservative margin in case the Arduino sends any trailing
+        #     status bytes after the M114 response.
+        #
+        #   Case B — M114 timed out (health_check() returned None):
+        #     The real M114 response may still be in-flight on the wire and
+        #     could arrive just as M705 is written. Without a settle delay it
+        #     would land inside M705's _write_and_wait() window and be returned
+        #     as rows_line. The regex r'ROWS=(\d+)\s+COLS=(\d+)' won't match
+        #     an M114 string, so _publish_layout_config() would log:
+        #       WARNING: could not parse M705 response: 'X:0.00 Y:0.00 ...'
+        #     _POST_M114_SETTLE_S (1.2 s) exceeds the worst-case M114 round-trip
+        #     latency observed on a Mega at 115200 baud, so the stale response
+        #     always clears the reader thread's unsolicited path before M705 is
+        #     written. The serial_handler's pre-write stale-drain in
+        #     _write_and_wait() then has nothing left to discard, and the M705
+        #     real response is the first line that lands in the queue.
+        logger.debug(
+            "Waiting %.1f s for serial RX to settle before layout queries…",
+            _POST_M114_SETTLE_S,
+        )
+        time.sleep(_POST_M114_SETTLE_S)
         self._publish_layout_config()
  
     def _publish_layout_config(self) -> None:
-       try:
-           rows_line   = self.serial.send_command("M705")
-           pitch_line  = self.serial.send_command("M706")
-           offset_line = self.serial.send_command("M707")
-           # M799 removed — not implemented in firmware. Machine limits are
-           # derived locally from grid geometry instead and published
-           # separately as a LIMITS line (see _publish_limits below) so the
-           # server's existing LIMITS handler in main.py actually receives
-           # something — without this, gantry_state.limit_x/y/c_mm stay
-           # null forever (Mismatch 9).
-       except Exception:
-           logger.exception("_publish_layout_config: serial error — skipping LAYOUT_CONFIG.")
-           return
-   
-       payload: dict = {"type": "LAYOUT_CONFIG"}
-       parsed_any = False
-   
-       # Check for E-stop state — Arduino replies "E-stop" to all commands when stopped
-       ESTOP_STR = "e-stop"
-       for name, val in [("M705", rows_line), ("M706", pitch_line), ("M707", offset_line)]:
-           if val and val.strip().lower() == ESTOP_STR:
-               logger.warning(
-                   "_publish_layout_config: Arduino is in E-stop state "
-                   "— LAYOUT_CONFIG not published. Send M17 to re-enable."
-               )
-               return
-   
-       # Parse M705: ROWS=12 COLS=7
-       if rows_line:
-           m = re.search(r'ROWS=(\d+)\s+COLS=(\d+)', rows_line, re.IGNORECASE)
-           if m:
-               payload["grid_rows"] = int(m.group(1))
-               payload["grid_cols"] = int(m.group(2))
-               parsed_any = True
-           else:
-               logger.warning("_publish_layout_config: could not parse M705 response: %r", rows_line)
-   
-       # Parse M706: Pitch X=50.0 Y=50.0
-       if pitch_line:
-           m = re.search(r'Pitch\s+X=([-\d.]+)\s+Y=([-\d.]+)', pitch_line, re.IGNORECASE)
-           if m:
-               payload["pitch_x_mm"] = float(m.group(1))
-               payload["pitch_y_mm"] = float(m.group(2))
-               parsed_any = True
-           else:
-               logger.warning("_publish_layout_config: could not parse M706 response: %r", pitch_line)
-   
-       # Parse M707: Offsets X0=0.0 Y0=0.0
-       if offset_line:
-           m = re.search(r'Offsets\s+X0=([-\d.]+)\s+Y0=([-\d.]+)', offset_line, re.IGNORECASE)
-           if m:
-               payload["x0_offset_mm"] = float(m.group(1))
-               payload["y0_offset_mm"] = float(m.group(2))
-               parsed_any = True
-           else:
-               logger.warning("_publish_layout_config: could not parse M707 response: %r", offset_line)
-   
-       if parsed_any:
-           mqtt_client.publish_response(json.dumps(payload))
-           logger.info(
-               "LAYOUT_CONFIG published: rows=%s cols=%s pitch=(%s,%s) offset=(%s,%s)",
-               payload.get("grid_rows"), payload.get("grid_cols"),
-               payload.get("pitch_x_mm"), payload.get("pitch_y_mm"),
-               payload.get("x0_offset_mm"), payload.get("y0_offset_mm"),
-           )
-           # Derive and publish machine limits now that we have fresh
-           # grid/pitch/offset values to compute them from (FIX Mismatch 9).
-           self._publish_limits(payload)
-       else:
-           logger.warning("_publish_layout_config: no valid responses from Arduino — LAYOUT_CONFIG not published.")
+        # Noise substrings the Arduino firmware emits before the real response.
+        # serial_handler._write_and_wait() already filters these, but we guard
+        # here too so a response that slips through is never silently
+        # mis-attributed as an M705/M706/M707 result and causes a parse warning.
+        _NOISE = ("yo! on my way", "on my way")
+
+        def _is_noise(val: Optional[str]) -> bool:
+            return val is not None and any(n in val.strip().lower() for n in _NOISE)
+
+        try:
+            rows_line   = self.serial.send_command("M705")
+            # Small inter-command delay: gives the Arduino RX buffer time to
+            # drain the "Yo! On my way!" echo from M705 before M706 is sent,
+            # so the M705 echo cannot bleed into M706's response window.
+            time.sleep(0.2)
+            pitch_line  = self.serial.send_command("M706")
+            time.sleep(0.2)
+            offset_line = self.serial.send_command("M707")
+            # M799 removed — not implemented in firmware. Machine limits are
+            # derived locally from grid geometry instead and published
+            # separately as a LIMITS line (see _publish_limits below) so the
+            # server's existing LIMITS handler in main.py actually receives
+            # something — without this, gantry_state.limit_x/y/c_mm stay
+            # null forever (Mismatch 9).
+        except Exception:
+            logger.exception("_publish_layout_config: serial error — skipping LAYOUT_CONFIG.")
+            return
+
+        # Treat noise echoes the same as None (no real response received).
+        if _is_noise(rows_line):
+            logger.warning(
+                "_publish_layout_config: M705 returned firmware echo instead of "
+                "real response (%r) — treating as no response.", rows_line
+            )
+            rows_line = None
+        if _is_noise(pitch_line):
+            logger.warning(
+                "_publish_layout_config: M706 returned firmware echo instead of "
+                "real response (%r) — treating as no response.", pitch_line
+            )
+            pitch_line = None
+        if _is_noise(offset_line):
+            logger.warning(
+                "_publish_layout_config: M707 returned firmware echo instead of "
+                "real response (%r) — treating as no response.", offset_line
+            )
+            offset_line = None
+
+        payload: dict = {"type": "LAYOUT_CONFIG"}
+        parsed_any = False
+
+        # Check for E-stop state — Arduino replies "E-stop" to all commands when stopped
+        ESTOP_STR = "e-stop"
+        for name, val in [("M705", rows_line), ("M706", pitch_line), ("M707", offset_line)]:
+            if val and val.strip().lower() == ESTOP_STR:
+                logger.warning(
+                    "_publish_layout_config: Arduino is in E-stop state "
+                    "— LAYOUT_CONFIG not published. Send M17 to re-enable."
+                )
+                return
+
+        # Parse M705: ROWS=12 COLS=7
+        if rows_line:
+            m = re.search(r'ROWS=(\d+)\s+COLS=(\d+)', rows_line, re.IGNORECASE)
+            if m:
+                payload["grid_rows"] = int(m.group(1))
+                payload["grid_cols"] = int(m.group(2))
+                parsed_any = True
+            else:
+                logger.warning("_publish_layout_config: could not parse M705 response: %r", rows_line)
+
+        # Parse M706: Pitch X=50.0 Y=50.0
+        if pitch_line:
+            m = re.search(r'Pitch\s+X=([-\d.]+)\s+Y=([-\d.]+)', pitch_line, re.IGNORECASE)
+            if m:
+                payload["pitch_x_mm"] = float(m.group(1))
+                payload["pitch_y_mm"] = float(m.group(2))
+                parsed_any = True
+            else:
+                logger.warning("_publish_layout_config: could not parse M706 response: %r", pitch_line)
+
+        # Parse M707: Offsets X0=0.0 Y0=0.0
+        if offset_line:
+            m = re.search(r'Offsets\s+X0=([-\d.]+)\s+Y0=([-\d.]+)', offset_line, re.IGNORECASE)
+            if m:
+                payload["x0_offset_mm"] = float(m.group(1))
+                payload["y0_offset_mm"] = float(m.group(2))
+                parsed_any = True
+            else:
+                logger.warning("_publish_layout_config: could not parse M707 response: %r", offset_line)
+
+        if parsed_any:
+            mqtt_client.publish_response(json.dumps(payload))
+            logger.info(
+                "LAYOUT_CONFIG published: rows=%s cols=%s pitch=(%s,%s) offset=(%s,%s)",
+                payload.get("grid_rows"), payload.get("grid_cols"),
+                payload.get("pitch_x_mm"), payload.get("pitch_y_mm"),
+                payload.get("x0_offset_mm"), payload.get("y0_offset_mm"),
+            )
+            # Derive and publish machine limits now that we have fresh
+            # grid/pitch/offset values to compute them from (FIX Mismatch 9).
+            self._publish_limits(payload)
+        else:
+            logger.warning("_publish_layout_config: no valid responses from Arduino — LAYOUT_CONFIG not published.")
 
     def _publish_limits(self, layout: dict) -> None:
         """
@@ -443,16 +523,18 @@ class Bridge:
             except Exception:
                 logger.exception("Heartbeat publish failed.")
             # Sleep in small increments so stop() is responsive.
-            for _ in range(int(HEARTBEAT_INTERVAL_S * 2)):
+            # BUG-17 FIX: use round() instead of int() so non-integer
+            # HEARTBEAT_INTERVAL_S values get the correct iteration count.
+            for _ in range(round(HEARTBEAT_INTERVAL_S * 2)):
                 if self._stop_event.is_set():
                     return
                 time.sleep(0.5)
  
     def _publish_heartbeat(self) -> None:
-        # Read camera_status from the cached result of the go2rtc health check
+        # Read camera_status from the cached result of the MediaMTX health check
         # (Section 5.6). The health thread updates this every 30s in the
         # background — calling last_status here is non-blocking.
-        camera_status = go2rtc_health.last_status
+        camera_status = mediamtx_health.last_status
  
         payload = {
             "status": "online",
@@ -507,9 +589,10 @@ class Bridge:
                 if isinstance(payload, dict):
                     payload_dict = payload
                 elif isinstance(payload, str):
-                    import json as _json
+                    # BUG-20 FIX: use top-level json import (line 41) instead
+                    # of re-importing inside this hot path on every SCAN_START.
                     try:
-                        payload_dict = _json.loads(payload)
+                        payload_dict = json.loads(payload)
                     except Exception:
                         pass
                 payload_dict["rack_id"] = self.device_id

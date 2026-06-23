@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config.settings import settings
@@ -45,7 +45,7 @@ class PendingCommandEntry:
 
     @property
     def is_timed_out(self) -> bool:
-        return datetime.utcnow() > self.timeout_at
+        return datetime.now(timezone.utc) > self.timeout_at
 
 
 # ── Abstract interface ────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ class SQLiteCacheBackend(CacheBackend):
         from db.database import db_session
         from db.models import PendingCommand
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with db_session() as db:
             row = db.query(PendingCommand).filter_by(rack_id=rack_id).first()
             if row:
@@ -209,7 +209,7 @@ class SQLiteCacheBackend(CacheBackend):
         from db.database import db_session
         from db.models import PendingCommand
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with db_session() as db:
             rows = (
                 db.query(PendingCommand)
@@ -236,7 +236,7 @@ class SQLiteCacheBackend(CacheBackend):
         from db.database import db_session
         from db.models import CaptureAttribution
 
-        expires_at = datetime.utcnow() + timedelta(seconds=ttl_s)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_s)
         with db_session() as db:
             row = db.query(CaptureAttribution).filter_by(rack_id=rack_id).first()
             if row:
@@ -257,7 +257,7 @@ class SQLiteCacheBackend(CacheBackend):
         from db.database import db_session
         from db.models import CaptureAttribution
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with db_session() as db:
             row = db.query(CaptureAttribution).filter_by(rack_id=rack_id).first()
             if row and row.expires_at > now:
@@ -269,7 +269,7 @@ class SQLiteCacheBackend(CacheBackend):
         from db.database import db_session
         from db.models import CaptureAttribution
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with db_session() as db:
             row = db.query(CaptureAttribution).filter_by(rack_id=rack_id).first()
             if not row:

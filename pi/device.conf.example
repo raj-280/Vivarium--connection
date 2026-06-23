@@ -1,19 +1,21 @@
 # =============================================================================
 # Vivarium Gantry System — Pi device configuration (Section 2.2)
 # =============================================================================
-# Real path: /etc/gantry/device.conf, mode 600 (owner read/write only).
+# Real path: /etc/vivarium/device.conf, mode 600 (owner pi:pi).
 # Written automatically by pi/provisioner.py on first boot (Section 5.3) —
 # you should not normally need to hand-edit this file on a real Pi.
 #
 # ── Local testing ────────────────────────────────────────────────────────
-# pi/config/settings.py reads /etc/gantry/device.conf by default. To test
-# without root, copy this file somewhere writable and point at it:
+# pi/config/settings.py ALWAYS reads /etc/vivarium/device.conf.
+# To test on a dev machine, create the file there:
 #
-#     cp pi/device.conf.example /tmp/device.conf
-#     export GANTRY_DEVICE_CONF=/tmp/device.conf
+#     sudo mkdir -p /etc/vivarium
+#     sudo cp pi/device.conf.example /etc/vivarium/device.conf
+#     sudo chmod 600 /etc/vivarium/device.conf
+#     sudo chown $USER /etc/vivarium/device.conf
 #
-# No code changes are needed to go back to the real path — just unset
-# GANTRY_DEVICE_CONF on the actual Pi.
+# NOTE: GANTRY_DEVICE_CONF env var is NOT supported — settings.py hard-codes
+# /etc/vivarium/device.conf. Pass conf_path= in unit tests instead.
 # =============================================================================
 
 [identity]
@@ -37,6 +39,7 @@ rtsp_password =
 
 [mqtt]
 # Mirrors the server's MQTT_BROKER / MQTT_PORT (Section 2.1).
+# Written by provisioner.py from env var GANTRY_MQTT_BROKER (set by setup.sh).
 broker_host = localhost
 broker_port = 1883
 
@@ -46,20 +49,29 @@ ca_cert_path =
 
 [serial]
 # Arduino link configuration (Section 2.2 / 6).
-# For the Stage 7 socat test, point this at one end of the virtual pair —
-# see the test instructions for the exact device name.
-serial_port = /dev/ttyACM0
+# "auto" → SerialHandler scans /dev/ttyACM* and /dev/ttyUSB* and picks the
+# first Arduino it finds.  Pin to a fixed port (e.g. /dev/ttyACM0) only if
+# you have multiple serial devices.
+# Matches: settings.py _DEFAULTS["serial"]["serial_port"] and
+#          provisioner.py _write_device_conf() serial_port value.
+serial_port = auto
 serial_baud = 115200
-serial_timeout_s = 5
+# 10 s: enough headroom for slow firmware responses without hanging forever.
+# Matches: settings.py _DEFAULTS["serial"]["serial_timeout_s"] = "10"
+#          provisioner.py _write_device_conf() serial_timeout_s value.
+serial_timeout_s = 10
 serial_retry_count = 1
 
 [capture]
-# Local-first capture directory (Section 5.4 / 12). Used when
-# S3_ENABLED=false on the server (current default).
-capture_dir = ./captures
+# On a real Pi, provisioner.py writes the absolute path:
+#   /var/vivarium/{device_id}/captures
+# which setup.sh pre-creates (mode 750, owner pi:pi).
+# For local dev/testing without a real Pi, use a relative path:
+#   ./captures
+# Matches: provisioner.py _write_device_conf() capture_dir value (real Pi).
+#          settings.py _DEFAULTS["capture"]["capture_dir"] (dev fallback).
+capture_dir = /var/vivarium/rack-test/captures
 
-# batch_upload_enabled stays false until BOTH this flag AND S3_ENABLED on
-# the server are true (Section 5.4 / 12) — config-only S3 upgrade path.
 batch_upload_enabled = false
 
 # true on a real Pi (/tmp is RAM-backed tmpfs). false for local dev/testing
@@ -67,10 +79,13 @@ batch_upload_enabled = false
 tmp_is_tmpfs = false
 
 [streaming]
-# go2rtc RTSP port (Section 5.6). Stream name should match device_id so it
-# lines up with the server's stream registry (Section 8).
-go2rtc_port = 8554
-go2rtc_stream_name = rack-test
+# MediaMTX RTSP port (Section 5.6).
+# Matches: provisioner.py _MEDIAMTX_DEFAULT_PORT = "8554"
+#          mediamtx/mediamtx.example.yaml  rtspAddress: ":{{MEDIAMTX_PORT}}"
+mediamtx_port = 8554
+# stream_name MUST match device_id — the server builds the RTSP URL from it
+# (Section 8).  provisioner.py always sets this to the assigned device_id.
+stream_name = rack-test
 
 [scan]
 # How often the Pi pings the server to extend a scan lock (Section 4.3 / 4.7).

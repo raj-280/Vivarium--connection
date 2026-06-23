@@ -111,6 +111,10 @@ class ScanExecutor:
         self._abort_requested = threading.Event()
         self._running = threading.Event()
         self._lock = threading.Lock()
+        # Separate event to stop the keepalive loop — avoids the race where
+        # setting _stop_requested (to signal end-of-scan) also prematurely
+        # stops an ongoing keepalive before the final G28 completes (BUG-08).
+        self._keepalive_stop = threading.Event()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -133,6 +137,7 @@ class ScanExecutor:
 
         self._stop_requested.clear()
         self._abort_requested.clear()
+        self._keepalive_stop.clear()
         self._running.set()
 
         progress = ScanProgress(
@@ -240,11 +245,12 @@ class ScanExecutor:
             col_range = range(0, cols) if row % 2 == 0 else range(cols - 1, -1, -1)
 
             for col in col_range:
-                # Skip cells before our resume point in the first row
                 if row == start_row:
                     if row % 2 == 0 and col < start_col:
                         continue
-                    if row % 2 != 0 and col > (cols - 1 - start_col):
+                    # BUG-02 FIX: odd rows go right→left; skip cols *higher* than
+                    # start_col (they were already done in the previous run).
+                    if row % 2 != 0 and col > start_col:
                         continue
 
                 # ── Abort check (! overrides, mid-cell check) ──────────
@@ -270,8 +276,8 @@ class ScanExecutor:
             if scan_aborted or scan_paused:
                 break
 
-        # ── Step 4: Stop the keepalive ────────────────────────────────────
-        self._stop_requested.set()   # signals keepalive loop to exit
+        # ── Step 4: Stop the keepalive (BUG-08 FIX: use dedicated event) ──
+        self._keepalive_stop.set()
 
         # ── Step 5: Final G28 if not aborted mid-motion ───────────────────
         if not scan_aborted:
@@ -396,13 +402,16 @@ class ScanExecutor:
         FIX (Mismatch 8): The server now handles SCAN_KEEPALIVE in
         _on_response_message and calls extend_lock() to prevent the scan
         lock from expiring mid-scan.
+
+        BUG-08 FIX: Uses _keepalive_stop (not _stop_requested) so the keepalive
+        continues running during the final G28 after the scan loop exits.
         """
         interval = settings.scan_lock_keepalive_interval_s
         logger.debug("ScanExecutor: keepalive loop started (interval=%.0fs)", interval)
 
-        while not self._stop_requested.is_set():
-            self._stop_requested.wait(timeout=interval)
-            if self._stop_requested.is_set():
+        while not self._keepalive_stop.is_set():
+            self._keepalive_stop.wait(timeout=interval)
+            if self._keepalive_stop.is_set():
                 break
             try:
                 mqtt_client.publish_response(

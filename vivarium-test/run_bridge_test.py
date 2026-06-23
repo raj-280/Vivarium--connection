@@ -32,7 +32,16 @@ repo_root = Path(__file__).resolve().parent.parent
 pi_dir = repo_root / "pi"
 sys.path.insert(0, str(pi_dir))
 
-# 3. Run the real bridge
+# 3. Patch detect_port() BEFORE importing bridge.py so Windows dev machines
+#    (which have no /dev/ttyACM* paths) don't raise SerialException.
+#    serial_handler.connect() calls detect_port() only when port == "auto".
+#    Returning "FAKE_COM0" means serial.Serial("FAKE_COM0", ...) is called —
+#    which is already patched to FakeSerial, so any port name works fine.
+from services import serial_handler as _sh
+_sh.SerialHandler.detect_port = lambda self: "FAKE_COM0"
+print("[run_bridge_test] detect_port() patched → 'FAKE_COM0'")
+
+# 4. Run the real bridge
 if __name__ == "__main__":
     import bridge
     b = bridge.Bridge()

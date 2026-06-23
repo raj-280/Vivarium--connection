@@ -14,7 +14,7 @@ Table order matters for FK resolution at create_all() time:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -54,7 +54,7 @@ class User(Base):
     username = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)          # bcrypt via passlib
     role = Column(String, nullable=False)                   # viewer / operator / admin
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     last_login_at = Column(DateTime, nullable=True)
 
     # Relationships
@@ -77,7 +77,7 @@ class Rack(Base):
     id = Column(String, primary_key=True, nullable=False)               # e.g. rack-047
     display_name = Column(String, nullable=False)
     location = Column(String, nullable=True)
-    pi_ip = Column(String, nullable=True)                               # Used by go2rtc pull list
+    pi_ip = Column(String, nullable=True)                               # Pi's LAN IP — used by MediaMTX for RTSP pull
     mqtt_username = Column(String, nullable=True)                       # Per-Pi MQTT identity
     mqtt_password_ref = Column(String, nullable=True)                   # MQTT credential, not raw in prod
     rtsp_password_ref = Column(String, nullable=True)                   # Handle, not raw secret
@@ -127,8 +127,8 @@ class Rack(Base):
     limit_y_mm = Column(Float, nullable=True)
     limit_c_mm = Column(Float, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Relationships
     lock_holder = relationship("User", back_populates="locked_racks", foreign_keys=[lock_holder_user_id])
@@ -223,7 +223,7 @@ class ImageRecord(Base):
     cell_row = Column(Integer, nullable=True)                           # Only for auto_scan images
     cell_col = Column(Integer, nullable=True)
     capture_timestamp = Column(DateTime, nullable=False)               # From Pi filename timestamp
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     rack = relationship("Rack", back_populates="image_records")
@@ -252,7 +252,7 @@ class AuditLog(Base):
     pi_credential_ref = Column(String, nullable=True)
     details = Column(Text, nullable=True)                              # JSON string — free-form context
     outcome = Column(String, nullable=False)                           # success / failure / flagged
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 # ===========================================================================
@@ -320,7 +320,7 @@ class PendingCommand(Base):
     rack_id = Column(String, ForeignKey("racks.id"), primary_key=True, nullable=False)
     command = Column(String, nullable=False)
     operator_id = Column(String, nullable=True)
-    published_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    published_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     retry_count = Column(Integer, nullable=False, default=0)
     timeout_at = Column(DateTime, nullable=False)
 

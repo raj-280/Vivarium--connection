@@ -31,7 +31,7 @@ apscheduler==3.10.4
 # --- Async file I/O (image delivery, local_path writes) ----------------------
 aiofiles==24.1.0
 
-# --- HTTP client (presign callbacks, go2rtc health checks) -------------------
+# --- HTTP client (presign callbacks, MediaMTX health checks) -----------------
 httpx==0.27.2
 
 # --- Optional: Redis (only needed when CACHE_BACKEND=redis) ------------------

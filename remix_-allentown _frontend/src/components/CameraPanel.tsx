@@ -4,8 +4,10 @@
  * Section 7 / Section 8 — Live video + Capture button.
  *
  * Behaviour:
- *   - When streamUrl is non-null (lock held), opens a <video> element at
- *     that URL for WebRTC via go2rtc.
+ *   - When streamUrl is non-null (lock held), opens a WebRTC session to the
+ *     Pi's MediaMTX using the WHEP protocol (RFC draft).
+ *   - The WHEP URL (e.g. http://192.168.1.50:8889/rack-001/whep) is sent by
+ *     the server over WebSocket as part of the stream_url message.
  *   - Capture button sends "CAPTURE" command over WS (CSRF injected by wsClient).
  *   - On CAPTURE_STARTED:  spinner appears.
  *   - On capture_complete: spinner clears, success flash shown.
@@ -13,6 +15,23 @@
  *     capture_complete never arrives (Section 9 Layer 1).
  *   - Viewer role: no Capture button (read-only feed).
  *   - When streamUrl is null: placeholder is shown.
+ *
+ * BUG FIX (Bug 5 — WebRTC implementation):
+ *   The original code used <video src={streamUrl}> which is WRONG for WHEP.
+ *   A WHEP endpoint is NOT an MP4/HLS URL — it requires a multi-step WebRTC
+ *   handshake over HTTP (POST SDP offer → get SDP answer → RTCPeerConnection).
+ *   Putting a WHEP URL in <video src> just fires a GET and gets a 405 error,
+ *   leaving the video element permanently blank.
+ *
+ *   Fix: useWhepStream() hook implements the correct WHEP negotiation:
+ *     1. Create RTCPeerConnection with a single recv-only transceiver.
+ *     2. Create an SDP offer locally (createOffer).
+ *     3. POST the offer to the WHEP endpoint (Content-Type: application/sdp).
+ *     4. Set the SDP answer from the response as the remote description.
+ *     5. Attach the resulting MediaStream to video.srcObject (NOT video.src).
+ *
+ *   MJPEG fallback: if streamUrl is empty but mjpegUrl is set, a plain <img>
+ *   element is used as a last resort (works in all browsers, no JS needed).
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -25,14 +44,158 @@ import type { WsMessage } from '../types/gantry.types';
 import wsClient from '../lib/wsClient';
 
 type CaptureState = 'idle' | 'pending' | 'success' | 'error';
+type StreamStatus = 'idle' | 'connecting' | 'connected' | 'error';
 
 interface CameraPanelProps {
   rackId?: string;
   className?: string;
 }
 
+// ===========================================================================
+// useWhepStream — WHEP WebRTC negotiation hook
+// ===========================================================================
+//
+// WHEP (WebRTC HTTP Egress Protocol) is MediaMTX's mechanism for browser-side
+// WebRTC.  It is NOT a media URL — it is an HTTP signalling endpoint.
+//
+// Protocol:
+//   1. Client creates an RTCPeerConnection and adds a recvonly transceiver.
+//   2. Client calls createOffer() and setLocalDescription(offer).
+//   3. Client waits for ICE gathering to complete.
+//   4. Client POSTs the gathered SDP to the WHEP URL
+//      (Content-Type: application/sdp).
+//   5. Server responds with 201 Created + SDP answer body.
+//   6. Client calls setRemoteDescription(answer).
+//   7. RTCPeerConnection fires ontrack — client attaches stream to video.srcObject.
+//
+// The hook tears down the RTCPeerConnection on unmount or when whepUrl changes.
+
+function useWhepStream(
+  videoRef: React.RefObject<HTMLVideoElement>,
+  whepUrl: string | null,
+) {
+  const [status, setStatus] = useState<StreamStatus>('idle');
+  const [error, setError]   = useState<string | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+
+  const teardown = useCallback(() => {
+    if (pcRef.current) {
+      pcRef.current.ontrack          = null;
+      pcRef.current.onicecandidate   = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, [videoRef]);
+
+  useEffect(() => {
+    if (!whepUrl) {
+      teardown();
+      setStatus('idle');
+      setError(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    const negotiate = async () => {
+      teardown();
+      setStatus('connecting');
+      setError(null);
+
+      const pc = new RTCPeerConnection({
+        iceServers: [],  // LAN-only — no STUN/TURN needed on the same Wi-Fi
+      });
+      pcRef.current = pc;
+
+      // Add a recv-only transceiver for video; audio is optional.
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      pc.ontrack = (evt) => {
+        if (cancelled) return;
+        if (videoRef.current && evt.streams[0]) {
+          videoRef.current.srcObject = evt.streams[0];
+          setStatus('connected');
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (cancelled) return;
+        const state = pc.connectionState;
+        if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+          setStatus('error');
+          setError(`WebRTC connection ${state}.`);
+        }
+      };
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Wait for ICE gathering to finish (gives MediaMTX a complete SDP)
+        await new Promise<void>((resolve) => {
+          if (pc.iceGatheringState === 'complete') { resolve(); return; }
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') resolve();
+          };
+          // Safety timeout — proceed after 5s even if gathering is incomplete
+          setTimeout(resolve, 5000);
+        });
+
+        if (cancelled) return;
+
+        const sdpOffer = pc.localDescription?.sdp;
+        if (!sdpOffer) throw new Error('Failed to generate SDP offer.');
+
+        // POST SDP offer to the WHEP endpoint
+        const resp = await fetch(whepUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: sdpOffer,
+        });
+
+        if (!resp.ok) {
+          throw new Error(
+            `WHEP handshake failed: HTTP ${resp.status} from ${whepUrl}. ` +
+            `Check that the Pi is online and MEDIAMTX_PI_HOST is set correctly.`
+          );
+        }
+
+        const sdpAnswer = await resp.text();
+        if (cancelled) return;
+
+        await pc.setRemoteDescription(
+          new RTCSessionDescription({ type: 'answer', sdp: sdpAnswer })
+        );
+        // ontrack fires after setRemoteDescription — setStatus('connected') there
+
+      } catch (err: unknown) {
+        if (cancelled) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        setStatus('error');
+        setError(msg);
+        teardown();
+      }
+    };
+
+    negotiate();
+
+    return () => {
+      cancelled = true;
+      teardown();
+      setStatus('idle');
+    };
+  }, [whepUrl, videoRef, teardown]);
+
+  return { streamStatus: status, streamError: error };
+}
+
 export function CameraPanel({ rackId, className }: CameraPanelProps) {
-  const { sendCommand, activeRackId, userRole, streamUrl } = useSystem();
+  const { sendCommand, activeRackId, userRole, streamUrl, mjpegUrl } = useSystem();
   const target = rackId ?? activeRackId;
   const isViewer = userRole === 'viewer';
 
@@ -41,11 +204,25 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  // ── WHEP WebRTC hook (BUG FIX: replaces broken <video src={whepUrl}>) ──
+  // streamUrl is the WHEP URL e.g. http://192.168.1.50:8889/rack-001/whep.
+  // The hook negotiates RTCPeerConnection and sets video.srcObject automatically.
+  // If streamUrl is empty but mjpegUrl is set, the MJPEG fallback is shown instead.
+  const whepUrl = streamUrl || null;
+  const { streamStatus, streamError } = useWhepStream(videoRef, whepUrl);
+
+  // Decide what to render in the video area:
+  //   1. WHEP (WebRTC) — primary, handled by useWhepStream via video.srcObject
+  //   2. MJPEG fallback — <img> element, works in all browsers
+  //   3. Placeholder — no lock held yet
+  const showWhep  = Boolean(whepUrl);
+  const showMjpeg = !showWhep && Boolean(mjpegUrl);
+  const hasStream = showWhep || showMjpeg;
+
   // ── Listen for CAPTURE_STARTED and capture_complete on the global WS ──
   useEffect(() => {
     const handler = (msg: WsMessage) => {
       if (msg.type === 'status' && (msg.data as Record<string, unknown>)['CAPTURE_STARTED']) {
-        // Pi published CAPTURE_STARTED — start the hard timeout
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
         timeoutRef.current = setTimeout(() => {
           setCaptureState('error');
@@ -59,7 +236,6 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
         setTimeout(() => setCaptureState('idle'), 2500);
       }
 
-      // If we see a response with CAPTURE_STARTED inside the data blob
       if (
         msg.type === 'status' &&
         typeof (msg.data as Record<string, unknown>)['raw'] === 'string' &&
@@ -75,23 +251,16 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
     };
 
     wsClient.setOnMessage(handler);
-    return () => {
-      // Restore the context handler on unmount — SystemContext re-registers it
-      // on the next render cycle.
-    };
+    return () => {};
   }, []);
 
-  // Cleanup timeout on unmount
   useEffect(() => () => { if (timeoutRef.current) clearTimeout(timeoutRef.current); }, []);
 
   const handleCapture = useCallback(() => {
     if (!target || captureState === 'pending') return;
     setCaptureState('pending');
     setCaptureError(null);
-    // wsClient injects csrf_token automatically for type=CAPTURE
     wsClient.send({ type: 'CAPTURE', rack_id: target, command: 'CAPTURE' });
-
-    // Start the hard timeout immediately (server may not ACK in time)
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
     timeoutRef.current = setTimeout(() => {
       setCaptureState('error');
@@ -99,7 +268,11 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
     }, appConfig.captureTimeoutMs);
   }, [target, captureState]);
 
-  const hasStream = Boolean(streamUrl);
+  // Derive a human-readable stream badge label
+  const streamBadge = showWhep
+    ? (streamStatus === 'connected' ? 'WebRTC ✓' : streamStatus === 'connecting' ? 'Connecting…' : 'WebRTC')
+    : showMjpeg ? 'MJPEG' : null;
+  const badgeColour = streamStatus === 'connected' || showMjpeg ? 'text-green-400' : 'text-yellow-400';
 
   return (
     <div
@@ -114,10 +287,10 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
         <div className="flex items-center gap-2 text-[10px] font-mono text-slate-400 uppercase">
           <Video className="w-3 h-3" />
           <span>Live Feed</span>
-          {hasStream ? (
-            <span className="flex items-center gap-1 text-green-400">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-              WebRTC
+          {streamBadge ? (
+            <span className={cn('flex items-center gap-1', badgeColour)}>
+              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+              {streamBadge}
             </span>
           ) : (
             <span className="text-slate-600">No stream</span>
@@ -143,22 +316,68 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
 
       {/* Video / placeholder */}
       <div className="relative flex-1 min-h-[260px] flex items-center justify-center bg-gray-950">
-        {hasStream ? (
-          <video
-            ref={videoRef}
+
+        {/* ──────────────────────────────────────────────────
+             WebRTC (WHEP) — primary path
+             BUG FIX: video.srcObject is set by useWhepStream() above.
+             We do NOT use src=... for WHEP URLs — that would fire a plain
+             HTTP GET expecting an MP4, which always fails for a WHEP endpoint.
+             The <video> element is always mounted when showWhep=true so the
+             ref is stable for the hook to write into.
+             ────────────────────────────────────────────────── */}
+        <video
+          ref={videoRef}
+          className={cn(
+            'absolute inset-0 w-full h-full object-contain',
+            !showWhep && 'hidden',
+          )}
+          autoPlay
+          muted
+          playsInline
+          aria-label={`Live camera feed for rack ${target}`}
+          // NOTE: no `src` prop here — srcObject is set by useWhepStream()
+        />
+
+        {/* ──────────────────────────────────────────────────
+             MJPEG fallback — plain <img> polling the MJPEG endpoint.
+             Works in all browsers without any JS. Shown only when
+             streamUrl is empty but mjpegUrl is set.
+             ────────────────────────────────────────────────── */}
+        {showMjpeg && (
+          <img
+            src={mjpegUrl!}
             className="absolute inset-0 w-full h-full object-contain"
-            autoPlay
-            muted
-            playsInline
-            src={streamUrl!}
-            aria-label={`Live camera feed for rack ${target}`}
+            alt={`MJPEG fallback stream for rack ${target}`}
           />
-        ) : (
+        )}
+
+        {/* Placeholder — no lock held */}
+        {!hasStream && (
           <div className="flex flex-col items-center gap-3 text-slate-600">
             <Camera className="w-10 h-10 opacity-30" />
             <span className="text-[11px] font-mono uppercase">
               {target ? 'Awaiting lock for stream…' : 'No rack selected'}
             </span>
+          </div>
+        )}
+
+        {/* WebRTC connecting spinner (shown while WHEP negotiation is in progress) */}
+        {showWhep && streamStatus === 'connecting' && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+            <div className="flex flex-col items-center gap-2 text-slate-300">
+              <Loader2 className="w-8 h-8 animate-spin text-blue-400" />
+              <span className="text-[11px] font-mono uppercase">Negotiating WebRTC…</span>
+            </div>
+          </div>
+        )}
+
+        {/* WebRTC error banner (WHEP negotiation failed) */}
+        {showWhep && streamStatus === 'error' && streamError && (
+          <div className="absolute bottom-10 left-0 right-0 flex justify-center px-4">
+            <div className="flex items-center gap-2 bg-orange-900/80 text-orange-200 text-[11px] font-mono px-3 py-2 rounded-lg max-w-sm text-center">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{streamError}</span>
+            </div>
           </div>
         )}
 

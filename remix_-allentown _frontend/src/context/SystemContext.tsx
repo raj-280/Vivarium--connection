@@ -9,7 +9,7 @@
  *   piOnline          — true while Pi heartbeat is within the last ~60s
  *   mqttConnected     — last value from /health or connected message
  *   gridCells         — per-cell capture state for GantryGrid
- *   streamUrl         — active go2rtc WebRTC URL (non-null while lock held)
+ *   streamUrl         — active MediaMTX WebRTC URL (non-null while lock held)
  *   userRole          — role of the authenticated user
  *   activeRackId      — rack the operator is currently working on
  *   auth              — JWT token + userId + role (null when logged out)
@@ -101,7 +101,10 @@ interface SystemContextType {
   rackLayout: RackLayout | null;
 
   // ── Camera stream ─────────────────────────────────────────────────────────
+  /** WHEP URL for WebRTC (primary). e.g. http://192.168.1.50:8889/rack-001/whep */
   streamUrl: string | null;
+  /** MJPEG fallback URL. e.g. http://192.168.1.50:8888/rack-001/mjpeg */
+  mjpegUrl: string | null;
 
   // ── Alerts ───────────────────────────────────────────────────────────────
   alerts: AlertEntry[];
@@ -154,8 +157,9 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
   const [scanState, setScanState]           = useState<ScanState>('idle');
   const [gridCells, setGridCells]           = useState<GridCell[]>([]);
 
-  // Camera
+  // Camera — WHEP (primary) + MJPEG (fallback)
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [mjpegUrl, setMjpegUrl]   = useState<string | null>(null);
 
   // Alerts
   const [alerts, setAlerts] = useState<AlertEntry[]>([]);
@@ -229,11 +233,14 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
       }
 
       case 'stream_url':
-        setStreamUrl(msg.data.url);
+        // Server sends direct Pi URLs: url = WHEP, mjpeg_url = MJPEG fallback
+        setStreamUrl(msg.data.url || null);
+        setMjpegUrl(msg.data.mjpeg_url || null);
         break;
 
       case 'lock_released':
         setStreamUrl(null);
+        setMjpegUrl(null);
         break;
 
       case 'scan_status':
@@ -349,6 +356,7 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
     setWsStatus('disconnected');
     setPiOnline(false);
     setStreamUrl(null);
+    setMjpegUrl(null);
   }, []);
 
   // ── Rack subscription ──────────────────────────────────────────────────
@@ -418,6 +426,7 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
     rackLayout,
     // Camera
     streamUrl,
+    mjpegUrl,
     // Alerts
     alerts,
     dismissAlert,

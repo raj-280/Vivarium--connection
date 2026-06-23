@@ -193,6 +193,16 @@ class CameraHandler:
             mqtt_client.publish_response("CAPTURE_DONE")
             logger.info("capture: CAPTURE_DONE published")
 
+        except Exception as exc:
+            # BUG-13 FIX: publish CAPTURE_ERROR so the server releases the
+            # capture lock immediately rather than waiting for its expiry
+            # (up to CAPTURE_LOCK_TIMEOUT_S = 120s).
+            logger.error("capture: post-shoot pipeline failed: %s", exc)
+            try:
+                mqtt_client.publish_response(f"CAPTURE_ERROR:{exc}")
+            except Exception:
+                logger.exception("capture: could not publish CAPTURE_ERROR")
+
         finally:
             # ── Step 7: delete /tmp file (always, even on error) ──────────
             self._cleanup_tmp(tmp_path)

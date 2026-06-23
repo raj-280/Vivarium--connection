@@ -135,7 +135,7 @@ class ScanEngine:
             from db.database import db_session
             from db.models import Rack, ScanSchedule
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             with db_session() as db:
                 due_rows = (
                     db.query(ScanSchedule)
@@ -195,7 +195,7 @@ class ScanEngine:
             from db.models import Rack, ScanSchedule, ScanSession
             from core.locking import LockType, LockResult, acquire_lock
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             # ── Gate a: Pi online ──────────────────────────────────────────
             state = gantry_state.get(rack_id)
@@ -380,20 +380,32 @@ class ScanEngine:
             from db.models import ScanSession, Rack
             from core.locking import release_lock
 
+            offer_resume = False          # BUG-25 FIX: track outside db_session
+            offer_resume_args: tuple = ()
+
             with db_session() as db:
                 session = (
                     db.query(ScanSession).filter_by(id=session_id).first()
                     if session_id else None
                 )
                 rack = db.query(Rack).filter_by(id=rack_id).first()
+                # BUG-06 FIX: require a valid rack row; fall back to settings
+                # only when rack is genuinely absent from DB.
                 if rack:
                     grid_rows = rack.grid_rows
                     grid_cols = rack.grid_cols
+                else:
+                    # No rack in DB — nothing meaningful we can do.
+                    logger.warning(
+                        "on_scan_status: rack=%s not in DB — skipping status update",
+                        rack_id,
+                    )
+                    return
 
                 if status == "complete":
                     if session:
                         session.status = "complete"
-                        session.completed_at = datetime.utcnow()
+                        session.completed_at = datetime.now(timezone.utc)
                     if rack:
                         rack.scan_state = "complete"
                     release_lock(rack_id=rack_id, db=db)
@@ -407,8 +419,11 @@ class ScanEngine:
                         session.last_completed_col = last_col
                     if rack:
                         rack.scan_state = "paused"
-                    # Offer resume/restart prompt via WebSocket (Section 4.8)
-                    self._offer_resume_restart(
+                    # BUG-25 FIX: capture args, call _offer_resume_restart
+                    # AFTER the db_session closes so it doesn't start threads
+                    # inside an open transaction.
+                    offer_resume = True
+                    offer_resume_args = (
                         rack_id, session_id, last_row, last_col, grid_rows, grid_cols
                     )
 
@@ -430,6 +445,10 @@ class ScanEngine:
                             position_monitor.mark_stale_check_due(rack_id)
                         except Exception:
                             pass
+
+            # BUG-25 FIX: call after the session is committed and closed
+            if offer_resume:
+                self._offer_resume_restart(*offer_resume_args)
 
         except Exception:
             logger.exception("on_scan_status DB error for rack=%s", rack_id)
@@ -500,8 +519,40 @@ class ScanEngine:
                 rack_id, session_id, resume_row, resume_col,
             )
         else:
-            self._publish_scan_start(rack_id, None, grid_rows, grid_cols)
-            logger.info("ScanEngine: RESTART published for rack=%s", rack_id)
+            # BUG-16 FIX: on restart, create a new ScanSession row so the
+            # server DB is updated for the restarted scan. Previously
+            # session_id=None meant on_scan_progress skipped all DB updates.
+            try:
+                from db.database import db_session
+                from db.models import Rack, ScanSession
+
+                with db_session() as db:
+                    rack = db.query(Rack).filter_by(id=rack_id).first()
+                    if rack:
+                        new_session = ScanSession(
+                            rack_id=rack_id,
+                            status="running",
+                            started_at=datetime.now(timezone.utc),
+                            cells_total=rack.grid_rows * rack.grid_cols,
+                            cells_completed=0,
+                            cells_failed=0,
+                        )
+                        db.add(new_session)
+                        db.flush()
+                        session_id = new_session.id
+                        rack.scan_state = "running"
+                        grid_rows = rack.grid_rows
+                        grid_cols = rack.grid_cols
+                with self._lock:
+                    if session_id:
+                        self._active_sessions[rack_id] = session_id
+            except Exception:
+                logger.exception(
+                    "handle_resume_choice: failed to create restart session for rack=%s",
+                    rack_id,
+                )
+            self._publish_scan_start(rack_id, session_id, grid_rows, grid_cols)
+            logger.info("ScanEngine: RESTART published for rack=%s session=%s", rack_id, session_id)
 
     def trigger_manual_scan(self, rack_id: str, user_id: str, db) -> str:
         """
@@ -512,7 +563,7 @@ class ScanEngine:
             from db.models import Rack, ScanSession
             from core.locking import LockType, LockResult, acquire_lock
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             state = gantry_state.get(rack_id)
             pi_alive = state is not None and state.mqtt_status == "online"
@@ -654,7 +705,7 @@ class ScanEngine:
             from db.database import db_session
             from db.models import ScanSchedule
 
-            new_time = datetime.utcnow() + timedelta(minutes=minutes)
+            new_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
             with db_session() as db:
                 schedule = db.query(ScanSchedule).filter_by(rack_id=rack_id).first()
                 if schedule:

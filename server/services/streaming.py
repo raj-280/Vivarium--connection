@@ -3,26 +3,32 @@ server/services/streaming.py
 
 Live streaming URL builder — Section 4.2 / 8 / Stage 10.
 
-Implements the server side of the go2rtc streaming protocol described in
-Section 8:
+Implements the server side of the MediaMTX streaming protocol (Section 8):
 
   1. build_stream_url(rack_id)  → the WebSocket message the browser uses to
      open its <video> element:
          { "type": "stream_url",
            "data": { "rack_id": "rack-047",
-                     "url": "/camera/api/webrtc?src=rack-047",
-                     "mjpeg_url": "/camera/mjpeg?src=rack-047" } }
+                     "url":      "/camera/rack-047/whep",
+                     "mjpeg_url": "/camera/rack-047/mjpeg" } }
+
+     MediaMTX WebRTC uses the WHEP standard endpoint (no query params):
+         {STREAM_PROXY_PATH}/{rack_id}/whep
+     MediaMTX MJPEG:
+         {STREAM_PROXY_PATH}/{rack_id}/mjpeg
 
   2. build_stream_close(rack_id) → the WebSocket message sent when the lock
      is released, so the browser tears down the <video> element:
          { "type": "stream_close",
            "data": { "rack_id": "rack-047" } }
 
-  3. check_go2rtc_stream(rack_id) → probes the go2rtc HTTP API at
-     GO2RTC_INTERNAL_URL/api/streams to confirm the stream is registered
-     before issuing a stream_url.  Returns True/False.  Non-blocking timeout
-     of 2s — if the API is unreachable the URL is issued anyway (go2rtc may
-     just be starting up) and the fact is logged at WARNING.
+  3. check_mediamtx_stream(rack_id) → probes the MediaMTX REST API at
+     MEDIAMTX_INTERNAL_URL/v3/paths/list to confirm the stream path is
+     registered and READY before issuing a stream_url.  Returns True/False.
+     Non-blocking timeout of 2s — if the API is unreachable the URL is issued
+     anyway (MediaMTX may just be starting up) and the fact is logged at WARNING.
+     If MEDIAMTX_INTERNAL_URL is blank the probe is skipped and True is returned
+     (stream_url is always issued; the browser will retry the WHEP handshake).
 
   4. broadcast_stream_url(rack_id, user_id) → convenience wrapper that
      combines build_stream_url() + ws_registry.broadcast_from_thread()
@@ -31,26 +37,8 @@ Section 8:
 
   5. broadcast_stream_close(rack_id, user_id) → same for the close signal.
 
-Security notes (Section 9 Layer 2D):
-  • Stream URLs are only issued while the operator holds the rack lock
-    (called from routes.py acquire_lock — see wiring note below).
-  • user_rack_assignments check: the operator must be assigned to the rack.
-    This is enforced by the require_rack_operator dependency in routes.py;
-    streaming.py trusts that the caller has already validated assignment.
-  • [PROD ONLY] go2rtc on the server is bound to localhost:1984 and
-    reverse-proxied by Nginx with JWT validation at /camera/*.
-
-Wiring (routes.py):
-  After acquire_lock() returns LockResult.ACQUIRED, call:
-      from services.streaming import broadcast_stream_url
-      broadcast_stream_url(rack_id, user_id)
-
-  After release_lock_endpoint() succeeds, call:
-      from services.streaming import broadcast_stream_close
-      broadcast_stream_close(rack_id, user_id)
-
-  Both functions are fire-and-forget (run in the FastAPI thread;
-  ws_registry.broadcast_from_thread() handles async bridge internally).
+No Nginx required for local dev — MediaMTX serves WebRTC/MJPEG directly.
+[PROD ONLY] In production, reverse-proxy /camera/* → MediaMTX for HTTPS.
 """
 
 from __future__ import annotations
@@ -64,7 +52,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Timeout for the go2rtc health probe (seconds) — short so we don't stall
+# Timeout for the MediaMTX health probe (seconds) — short so we don't stall
 # the lock-acquisition HTTP response.
 _PROBE_TIMEOUT_S = 2
 
@@ -77,20 +65,31 @@ def build_stream_url(rack_id: str) -> dict[str, Any]:
     """
     Build the stream_url WebSocket message for rack_id (Section 8).
 
-    URL shape:
-        {GO2RTC_PROXY_PATH}/api/webrtc?src={rack_id}
-    where GO2RTC_PROXY_PATH defaults to "/camera" (config-driven, Section 2.1).
+    Direct-Pi URL approach (no server proxy):
+        WebRTC (WHEP): http://{MEDIAMTX_PI_HOST}:{MEDIAMTX_WEBRTC_PORT}/{rack_id}/whep
+        MJPEG fallback: http://{MEDIAMTX_PI_HOST}:{MEDIAMTX_MJPEG_PORT}/{rack_id}/mjpeg
 
-    The browser opens a WebRTC session at this URL via the Nginx reverse proxy
-    (localhost → go2rtc:1984, never exposed directly).
+    The browser connects directly to the Pi's MediaMTX instance, so there is
+    no video traffic on the Uvicorn server.  The Pi must be on the same
+    LAN/Wi-Fi network as the browser for these URLs to work.
 
-    A fallback MJPEG URL is also included for browsers that don't support
-    WebRTC or when go2rtc's WebRTC ICE negotiation fails:
-        {GO2RTC_PROXY_PATH}/mjpeg?src={rack_id}
+    If MEDIAMTX_PI_HOST is not configured, both URLs are returned as empty
+    strings and CameraPanel will show a configuration warning instead of a
+    broken video element.
     """
-    proxy = settings.GO2RTC_PROXY_PATH.rstrip("/")
-    webrtc_url = f"{proxy}/api/webrtc?src={rack_id}"
-    mjpeg_url  = f"{proxy}/mjpeg?src={rack_id}"
+    host = settings.MEDIAMTX_PI_HOST.strip()
+    if host:
+        webrtc_url = f"http://{host}:{settings.MEDIAMTX_WEBRTC_PORT}/{rack_id}/whep"
+        mjpeg_url  = f"http://{host}:{settings.MEDIAMTX_MJPEG_PORT}/{rack_id}/mjpeg"
+    else:
+        # Not yet configured — return empty strings so the frontend can show
+        # a helpful "check server/.env" message rather than a 404.
+        webrtc_url = ""
+        mjpeg_url  = ""
+        logger.warning(
+            "build_stream_url: MEDIAMTX_PI_HOST is not set — stream URLs will be empty. "
+            "Set MEDIAMTX_PI_HOST=<pi-lan-ip> in server/.env"
+        )
 
     return {
         "type": "stream_url",
@@ -118,58 +117,91 @@ def build_stream_close(rack_id: str) -> dict[str, Any]:
 
 
 # ===========================================================================
-# go2rtc stream presence probe (Section 8 / 9 Layer 2D)
+# MediaMTX stream presence probe (Section 8)
 # ===========================================================================
 
-def check_go2rtc_stream(rack_id: str) -> bool:
+def check_mediamtx_stream(rack_id: str) -> bool:
     """
-    Probe the go2rtc HTTP API to confirm the stream for rack_id is registered.
+    Probe the MediaMTX REST API to confirm the stream path for rack_id
+    is registered and active.
 
-    GET {GO2RTC_INTERNAL_URL}/api/streams
+    GET {MEDIAMTX_INTERNAL_URL}/v3/paths/list
 
-    The go2rtc API returns a JSON object whose keys are stream names.  If the
-    expected key is present, the stream is ready for the browser.
+    The MediaMTX API returns:
+        { "itemCount": N, "pageCount": N,
+          "items": [{"name": "rack-001", "ready": true, ...}, ...] }
 
-    Returns True  — stream is registered and ready.
-    Returns False — go2rtc unreachable, non-200 response, or stream absent.
+    Returns True  — path is registered AND ready (camera hardware is active).
+    Returns False — MediaMTX unreachable, non-200 response, path absent, or
+                    path present but ready=false (camera not yet started).
+
+    BUG FIX — two issues corrected here:
+      1. MEDIAMTX_INTERNAL_URL must be the Pi's IP, not localhost. If it is
+         blank (unconfigured) we skip the probe and return True so the stream
+         URL is still issued; the browser's WHEP retry will handle readiness.
+      2. We now check the 'ready' flag, not just path presence. With
+         sourceOnDemand:true the path is registered even when the camera is
+         off; only ready=true means the hardware is actually streaming.
 
     This probe is advisory: on False the caller still issues the stream_url
-    but logs a warning.  The browser will retry the WebRTC ICE handshake on
-    its own timeline.
+    but logs a warning. The browser will retry the WebRTC WHEP handshake.
     """
+    # BUG FIX 1: skip probe when URL is blank (not yet configured)
+    base_url = settings.MEDIAMTX_INTERNAL_URL.strip()
+    if not base_url:
+        logger.debug(
+            "check_mediamtx_stream: MEDIAMTX_INTERNAL_URL is not set — "
+            "skipping probe for rack=%s (set it to the Pi's IP:9997 in .env)",
+            rack_id,
+        )
+        return True  # issue stream_url; browser handles readiness via WHEP retry
+
     try:
-        api_url = f"{settings.GO2RTC_INTERNAL_URL.rstrip('/')}/api/streams"
+        api_url = f"{base_url.rstrip('/')}/v3/paths/list"
         req = urllib.request.Request(api_url, method="GET")
         with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
             if resp.status != 200:
                 logger.debug(
-                    "check_go2rtc_stream: HTTP %d for rack=%s", resp.status, rack_id
+                    "check_mediamtx_stream: HTTP %d for rack=%s", resp.status, rack_id
                 )
                 return False
             body = _json.loads(resp.read().decode())
 
-        if not isinstance(body, dict):
-            logger.debug(
-                "check_go2rtc_stream: unexpected response type %r", type(body)
-            )
+        items = body.get("items", [])
+        if not isinstance(items, list):
+            logger.debug("check_mediamtx_stream: unexpected items type %r", type(items))
             return False
 
-        present = rack_id in body
+        # BUG FIX 2: check 'ready' flag, not just path presence.
+        # With sourceOnDemand:true the path is registered immediately, but
+        # ready=false until a viewer connects and the camera hardware starts.
+        # Treating 'present' as 'online' masked an unplugged ribbon cable.
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name", "") == rack_id:
+                ready = item.get("ready", False)
+                logger.debug(
+                    "check_mediamtx_stream: rack=%s found, ready=%s",
+                    rack_id, ready,
+                )
+                return bool(ready)
+
         logger.debug(
-            "check_go2rtc_stream: rack=%s present=%s streams=%s",
-            rack_id, present, list(body.keys()),
+            "check_mediamtx_stream: rack=%s not found in paths=%s",
+            rack_id, [i.get("name") for i in items if isinstance(i, dict)],
         )
-        return present
+        return False
 
     except OSError as exc:
-        # Connection refused / timeout (go2rtc not running or not yet ready)
+        # Connection refused / timeout (MediaMTX not running or not yet ready)
         logger.warning(
-            "check_go2rtc_stream: go2rtc API unreachable (%s) — "
+            "check_mediamtx_stream: MediaMTX API unreachable (%s) — "
             "issuing stream_url anyway; browser will retry.", exc
         )
         return False
     except Exception as exc:
-        logger.warning("check_go2rtc_stream: unexpected error: %s", exc)
+        logger.warning("check_mediamtx_stream: unexpected error: %s", exc)
         return False
 
 
@@ -181,19 +213,19 @@ def broadcast_stream_url(rack_id: str, user_id: str) -> None:
     """
     Build and send the stream_url message to the lock-holder's WebSocket.
 
-    Probes go2rtc first; logs a warning if the stream is not yet registered
-    but sends the message regardless (browser will retry ICE).
+    Probes MediaMTX first; logs a warning if the stream path is not yet
+    registered but sends the message regardless (browser will retry WHEP).
 
     Safe to call from any thread — uses ws_registry.broadcast_from_thread().
     """
     # Import here to avoid circular import at module load time.
     from api.websocket import ws_registry  # noqa: PLC0415
 
-    stream_ready = check_go2rtc_stream(rack_id)
+    stream_ready = check_mediamtx_stream(rack_id)
     if not stream_ready:
         logger.warning(
-            "stream_url issued for rack=%s but go2rtc stream not yet registered "
-            "(go2rtc may be starting up or the Pi is offline)", rack_id
+            "stream_url issued for rack=%s but MediaMTX path not yet registered "
+            "(MediaMTX may be starting up or the Pi is offline)", rack_id
         )
 
     message = build_stream_url(rack_id)

@@ -8,7 +8,7 @@
  *   - Step size selector stores local state
  *   - Home button sends G28
  *   - "Move to Compartment" sends M700 Rn Cn
- *   - CameraPanel replaces the static video placeholder (WebRTC / go2rtc)
+ *   - CameraPanel replaces the static video placeholder (WebRTC / MediaMTX)
  *   - GantryGrid replaces the static Recent Captures strip
  *   - EmergencyStop rendered in the controls column — always visible
  *   - Position overlay reads from gantryPosition (not hardcoded strings)

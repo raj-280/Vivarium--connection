@@ -1,0 +1,101 @@
+# =============================================================================
+# Vivarium Gantry System — MediaMTX configuration template (Section 5.1/5.6/8)
+# =============================================================================
+#
+# This is a TEMPLATE. pi/setup.sh and pi/provisioner.py substitute the
+# placeholders below and write the live config to:
+#
+#     pi/mediamtx/mediamtx.yaml   (mode 600, read by vivarium-camera.service)
+#
+# ── Placeholders ─────────────────────────────────────────────────────────────
+#   {{DEVICE_ID}}       — this Pi's device_id (e.g. rack-001)
+#   {{RTSP_PASSWORD}}   — issued by POST /provision, stored in device.conf
+#   {{MEDIAMTX_PORT}}   — from device.conf [streaming] mediamtx_port (default 8554)
+#
+# ── MediaMTX version compatibility ───────────────────────────────────────────
+# This config targets MediaMTX v1.x (v1.0.0+).
+#   - "api: true" (bool) was valid in v0.x but BREAKS in v1.x where "api" is
+#     a struct. Use "api: yes" (bool synonym) or the struct form below.
+#     The safest cross-version form is the explicit struct shown below.
+#   - "http:" top-level key does NOT exist in v1.x. Use "hls:" for HLS.
+#   - "rpicamera://" source prefix was pre-v1.0. Use "source: rpiCamera" in v1.x.
+# =============================================================================
+
+# ── Path definitions ──────────────────────────────────────────────────────────
+# Each "path" is a named stream. The path name MUST equal device_id so the
+# server can build the correct RTSP/WebRTC URL. (Section 8)
+paths:
+  "{{DEVICE_ID}}":
+    # Pi Camera Module (CSI) — native libcamera source.
+    # v1.x keyword: "rpiCamera" (not "rpicamera://")
+    source: rpiCamera
+    sourceOnDemand: true     # open camera only while someone is watching
+
+    # Per-path authentication — only the server needs to pull this stream.
+    # [PROD ONLY] Change to a strong generated password (done by provisioner).
+    readUser: "{{DEVICE_ID}}"
+    readPass: "{{RTSP_PASSWORD}}"
+
+    # ── Camera Module 3 (autofocus hardware) ─────────────────────────────
+    rpiCameraWidth: 1920
+    rpiCameraHeight: 1080
+    rpiCameraFPS: 30
+    rpiCameraCodec: h264
+    rpiCameraBitrate: 4000000   # 4 Mbps — good quality for 1080p30
+    rpiCameraAfMode: continuous  # continuous hardware autofocus
+    rpiCameraAfSpeed: normal
+    rpiCameraAfRange: normal     # normal = close to infinity
+
+# ── RTSP server ───────────────────────────────────────────────────────────────
+# Listen on all interfaces so the server can pull from the Pi's LAN IP.
+# [PROD ONLY] UFW on the Pi restricts this port to the server IP only.
+rtspAddress: ":{{MEDIAMTX_PORT}}"
+
+# ── WebRTC (WHEP) ─────────────────────────────────────────────────────────────
+# The browser connects to the server's /camera/{device_id}/whep endpoint which
+# is reverse-proxied to this Pi's MediaMTX WebRTC port.
+# [PROD ONLY] set iceHostNAT1To1IPs to your Pi's LAN IP for direct ICE.
+webrtcAddress: ":8889"
+
+# ── HLS / MJPEG ───────────────────────────────────────────────────────────────
+# HLS/MJPEG fallback.
+# NOTE: MediaMTX v1.x uses "hls:" (bool) + "hlsAddress:" for the listen port.
+# There is NO "http:" top-level key in v1.x — that field causes "unknown field" error.
+hls: yes
+hlsAddress: ":8888"
+
+# ── API (health check) ────────────────────────────────────────────────────────
+# mediamtx_health.py calls GET http://localhost:9997/v3/paths/list
+#
+# FIX: In MediaMTX v1.x, "api" is a STRUCT, not a bool.
+# Writing "api: true" causes:
+#   json: cannot unmarshal object into Go struct field alias.api of type bool
+# The correct v1.x form is the explicit struct below.
+api:
+  address: "127.0.0.1:9997"  # localhost only — never exposed externally
+  encryption: "no"
+  serverKey: ""
+  serverCert: ""
+  allowOrigin: ""
+  trustedProxies: []
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logLevel: info
+logDestinations: [stdout]    # systemd captures stdout → journalctl
+
+# =============================================================================
+# Local testing (no real Pi / no real camera)
+# =============================================================================
+#
+# Replace source: rpiCamera with a test pattern:
+#
+#   paths:
+#     rack-test:
+#       source: "ffmpeg:source=testsrc=size=640x480:rate=15#video=h264"
+#
+# Requires ffmpeg on PATH.
+# View stream:
+#   vlc rtsp://rack-test:{RTSP_PASSWORD}@localhost:8554/rack-test
+#   curl http://localhost:8888/rack-test/index.m3u8
+#   curl http://localhost:9997/v3/paths/list
+# =============================================================================

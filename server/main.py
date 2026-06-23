@@ -34,8 +34,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI
@@ -156,8 +157,7 @@ def _on_response_message(
                                         setattr(rack, col, val)
                     except Exception:
                         logger.exception("_persist_layout failed for rack=%s", rid)
-                import threading as _thr
-                _thr.Thread(
+                threading.Thread(
                     target=_persist_layout,
                     args=(rack_id, _fields),
                     daemon=True,
@@ -186,8 +186,7 @@ def _on_response_message(
                             rack.limit_c_mm = c
                 except Exception:
                     logger.exception("_update_limits failed for rack=%s", rid)
-            import threading as _thr2
-            _thr2.Thread(
+            threading.Thread(
                 target=_update_limits, args=(rack_id, lx, ly, lc),
                 daemon=True, name=f"limits-persist-{rack_id}",
             ).start()
@@ -259,26 +258,27 @@ def _on_response_message(
             "CAPTURE_ERROR received for rack=%s: %s — releasing capture lock",
             rack_id, error_detail,
         )
+        # BUG-03 FIX: single db_session for lock release + audit write so they
+        # are atomic. Previously two separate sessions could produce an orphaned
+        # audit entry if the lock-release session failed.
         state = gantry_state.get(rack_id)
-        if state and state.lock_type == "capture":
-            with db_session() as db:
-                release_lock(rack_id=rack_id, db=db)
-            logger.info(
-                "Capture lock released after CAPTURE_ERROR for rack=%s", rack_id
-            )
-        # Audit the failure so operators can diagnose it
         try:
             with db_session() as db:
+                if state and state.lock_type == "capture":
+                    release_lock(rack_id=rack_id, db=db)
+                    logger.info(
+                        "Capture lock released after CAPTURE_ERROR for rack=%s", rack_id
+                    )
                 db.add(AuditLog(
                     event_type="capture_error",
                     rack_id=rack_id,
                     outcome="failure",
                     details=json.dumps({"error": error_detail}),
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
                 ))
         except Exception:
             logger.exception(
-                "CAPTURE_ERROR audit write failed for rack=%s", rack_id
+                "CAPTURE_ERROR lock-release + audit failed for rack=%s", rack_id
             )
 
     # ── SCAN_KEEPALIVE (FIX Mismatch 8) ──────────────────────────────────
@@ -369,7 +369,7 @@ def _on_image_message(
                     "local_path": local_path,
                     "s3_key": s3_key,
                 }),
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             ))
         return
 
@@ -388,7 +388,7 @@ def _on_image_message(
     try:
         capture_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
-        capture_ts = datetime.utcnow()
+        capture_ts = datetime.now(timezone.utc)
         logger.warning(
             "image message: could not parse capture_timestamp %r for rack=%s, using now",
             ts_str, rack_id,
@@ -412,7 +412,7 @@ def _on_image_message(
                 cell_row=cell_row,
                 cell_col=cell_col,
                 capture_timestamp=capture_ts,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             db.add(record)
             db.flush()
@@ -430,7 +430,7 @@ def _on_image_message(
                     "trigger_type": trigger_type,
                     "attribution_expired": attribution_expired,
                 }),
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             ))
 
     except IntegrityError:
@@ -449,7 +449,7 @@ def _on_image_message(
                     "local_path": local_path,
                     "s3_key": s3_key,
                 }),
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             ))
 
     if attribution_expired and not duplicate:
@@ -463,7 +463,7 @@ def _on_image_message(
                     "local_path": local_path,
                     "s3_key": s3_key,
                 }),
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             ))
 
     # ── 6. Release the capture lock ───────────────────────────────────────
@@ -561,8 +561,7 @@ def _on_status_message(
                 "status message: DB persist failed for rack=%s", rack_id
             )
 
-    import threading as _threading
-    _threading.Thread(
+    threading.Thread(
         target=_persist,
         daemon=True,
         name=f"status-persist-{rack_id}",
@@ -600,7 +599,7 @@ async def lifespan(app: FastAPI):
     except (RuntimeError, OSError) as exc:
         logger.warning("MQTT connect failed — server will run without MQTT: %s", exc)
 
-    ws_registry.set_loop(asyncio.get_event_loop())
+    ws_registry.set_loop(asyncio.get_running_loop())
 
     start_lock_sweep_task()
     logger.info("Lock sweep task started.")

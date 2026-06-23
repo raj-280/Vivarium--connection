@@ -47,7 +47,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config.settings import settings
@@ -299,7 +299,7 @@ class PositionMonitor:
             "homed_c": r.homed_c,
         }
         if r.all_homed:
-            kwargs["last_homed_at"] = datetime.utcnow()
+            kwargs["last_homed_at"] = datetime.now(timezone.utc)
         gantry_state.upsert(r.rack_id, **kwargs)
 
     def _persist_position(self, r: M114Result) -> None:
@@ -318,7 +318,7 @@ class PositionMonitor:
                 rack.homed_y = r.homed_y
                 rack.homed_c = r.homed_c
                 if r.all_homed:
-                    rack.last_homed_at = datetime.utcnow()
+                    rack.last_homed_at = datetime.now(timezone.utc)
         except Exception:
             logger.exception("_persist_position failed for rack=%s", r.rack_id)
 
@@ -391,7 +391,7 @@ class PositionMonitor:
                         "target_x": target_x, "target_y": target_y,
                         "error_x": err_x, "error_y": err_y,
                     }),
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
                 ))
         except Exception:
             logger.exception("_write_position_error_audit failed for rack=%s", r.rack_id)
@@ -408,7 +408,8 @@ class PositionMonitor:
 
         stale = (
             last_homed is None
-            or (datetime.utcnow() - last_homed)
+            or (datetime.now(timezone.utc) - last_homed.replace(tzinfo=timezone.utc)
+                   if last_homed.tzinfo is None else datetime.now(timezone.utc) - last_homed)
                > timedelta(hours=STALE_HOMING_THRESHOLD_HOURS)
         )
         if not stale:
@@ -466,7 +467,7 @@ class PositionMonitor:
             rec.in_recovery = True
             rec.recovery_attempt += 1
             rec.original_command = original_command
-            rec.triggered_at = datetime.utcnow()
+            rec.triggered_at = datetime.now(timezone.utc)
             attempt = rec.recovery_attempt
 
         logger.error(
@@ -516,6 +517,23 @@ class PositionMonitor:
         """Re-publish the original command after a successful re-home."""
         if not command:
             return
+        # BUG-18 FIX: check the rack still has a valid (non-expired) lock
+        # before retrying. The lock may have expired during the recovery
+        # sequence (G28 can take 30-60s).
+        state = gantry_state.get(rack_id)
+        lock_valid = (
+            state is not None
+            and state.lock_holder_user_id is not None
+            and state.lock_expires_at is not None
+            and state.lock_expires_at > datetime.now(timezone.utc)
+        )
+        if not lock_valid:
+            logger.warning(
+                "rack=%s _retry_command: lock expired during recovery — "
+                "NOT retrying command %r (attempt %d)",
+                rack_id, command, attempt,
+            )
+            return
         try:
             from services.mqtt_client import mqtt_client
             mqtt_client.publish_command(rack_id, command)
@@ -557,7 +575,7 @@ class PositionMonitor:
                     rack_id=rack_id,
                     outcome="flagged",
                     details=json.dumps({"reason": "position_error_after_re_home"}),
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
                 ))
         except Exception:
             logger.exception(
@@ -597,7 +615,7 @@ class PositionMonitor:
                     rack_id=rack_id,
                     outcome="success",
                     details=json.dumps({"reason": reason, "attempt": attempt}),
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
                 ))
         except Exception:
             logger.exception("_write_recovery_audit failed for rack=%s", rack_id)

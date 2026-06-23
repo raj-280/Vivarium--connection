@@ -30,7 +30,7 @@ Both decorators are applied here; the Limiter is mounted in main.py.
 
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Request, status
@@ -122,7 +122,7 @@ async def health():
     return {
         "status": "ok",
         "mqtt_connected": mqtt_client.is_connected,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -146,7 +146,7 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
         )
 
     # Record login timestamp
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = datetime.now(timezone.utc)
     db.commit()
 
     token = create_access_token(user_id=user.id, role=user.role)
@@ -272,7 +272,7 @@ async def acquire_lock(
     rack = db.query(RackModel).filter_by(id=rack_id).first()
 
     # ── Stream URL (Section 8) ────────────────────────────────────────────
-    # Send the go2rtc stream URL to the operator's WebSocket alongside the
+    # Send the MediaMTX stream URL to the operator's WebSocket alongside the
     # lock confirmation, so CameraPanel.tsx can open the <video> element.
     # This is fire-and-forget — a WebSocket error here must not fail the
     # HTTP lock response.
