@@ -23,10 +23,32 @@ class WsClient {
   private reconnectDelay = appConfig.wsReconnectBaseMs;
   private intentionallyClosed = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private pendingSubscribe: string | null = null;  // ← ADDED
+  private pendingSubscribe: string | null = null;
 
   private onStatusChange: StatusCallback | null = null;
-  private onMessage: MessageCallback | null = null;
+
+  // FIX (Bug 4): replaced single onMessage callback with a listener set so
+  // multiple components (CameraPanel, SystemContext, etc.) can subscribe
+  // independently without stomping each other.  setOnMessage() is kept for
+  // backward-compat but now registers into the same set.
+  private _messageListeners: Set<MessageCallback> = new Set();
+
+  /** @deprecated Use addMessageListener / removeMessageListener instead. */
+  setOnMessage(cb: MessageCallback) {
+    // Replace any previously registered via this legacy path by clearing the
+    // set first, then adding.  Components that use addMessageListener are
+    // unaffected because they manage their own handle.
+    this._messageListeners.clear();
+    this._messageListeners.add(cb);
+  }
+
+  addMessageListener(cb: MessageCallback): void {
+    this._messageListeners.add(cb);
+  }
+
+  removeMessageListener(cb: MessageCallback): void {
+    this._messageListeners.delete(cb);
+  }
 
   init(token: string) {
     this.token = token;
@@ -72,7 +94,6 @@ class WsClient {
   }
 
   setOnStatusChange(cb: StatusCallback) { this.onStatusChange = cb; }
-  setOnMessage(cb: MessageCallback) { this.onMessage = cb; }
 
   get isOpen() {
     return this.ws?.readyState === WebSocket.OPEN;
@@ -117,6 +138,7 @@ class WsClient {
       }
 
       this.onMessage?.(parsed);
+      this._messageListeners.forEach(cb => cb(parsed));
     };
 
     this.ws.onerror = (e) => {

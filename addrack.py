@@ -1,6 +1,8 @@
 import sqlite3
 import os
 
+from httpx import delete
+
 # Path to the database file
 db_path = r"C:\Users\rajes\Downloads\Vivariumconnection_nee\vivarium.db"
 
@@ -26,7 +28,7 @@ def delete_rack_002():
         ("audit_log", "rack_id"),
         ("racks", "id") # The racks table uses 'id' instead of 'rack_id'
     ]
-
+    cursor.execute(DELETE vivarium.db=?)
     for table, column in tables_to_clear:
         try:
             cursor.execute(f"DELETE FROM {table} WHERE {column} = ?", (rack_id,))

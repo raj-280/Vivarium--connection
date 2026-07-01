@@ -23,7 +23,7 @@ Responsibilities
 4. POST {cpu_serial, provisioning_secret, provision_token?, pi_ip?} to
    {GANTRY_SERVER_URL}/provision (default http://localhost:8000).
 
-5. Write the returned credentials into pi/config/device.conf (mode 0o600).
+5. Write the returned credentials into /etc/vivarium/device.conf (mode 0o600).
    This is the SAME file that pi/config/settings.py reads — no path config
    needed on either side.
 
@@ -38,7 +38,6 @@ Exit codes
 from __future__ import annotations
 
 import configparser
-import json
 import logging
 import os
 import socket
@@ -66,9 +65,9 @@ logger = logging.getLogger("provisioner")
 
 # device.conf is written to /etc/vivarium/device.conf — a permanent system
 # path that survives git pulls, redeployments, and OS upgrades.  The /etc/
-# location is owned root:pi (mode 750 for the directory, 600 for the file)
-# so only the bridge/provisioner running as the pi user can read it, and no
-# code update can accidentally overwrite or delete it.
+# location is owned root:SERVICE_USER (mode 750 for the directory, 600 for
+# the file) so only the bridge/provisioner running as SERVICE_USER can read
+# it, and no code update can accidentally overwrite or delete it.
 #
 # pi/config/settings.py reads from the same path.
 DEVICE_CONF_PATH: Path = Path("/etc/vivarium/device.conf")
@@ -96,6 +95,24 @@ HTTP_RETRY_DELAY_S: float = float(os.environ.get("GANTRY_PROVISION_RETRY_DELAY_S
 # Written to BOTH device.conf [streaming] mediamtx_port AND mediamtx.yaml
 # rtspAddress — changing this one constant keeps both files in sync.
 _MEDIAMTX_DEFAULT_PORT: str = "8554"
+
+# Service user — chown target for /etc/vivarium/, device.conf, and mediamtx.yaml.
+# setup.sh detects this dynamically from $SUDO_USER and writes it as
+# GANTRY_SERVICE_USER into provisioner.env, which vivarium-provisioner.service
+# loads via EnvironmentFile=.  Both vivarium-bridge.service and
+# vivarium-camera.service run as this user (User={{SERVICE_USER}} substituted
+# by setup.sh), so they must own the files provisioner writes here.
+# Falls back to "pi" for backward compatibility on standard Raspberry Pi OS
+# images where the default account is still named "pi".
+SERVICE_USER: str = os.environ.get("GANTRY_SERVICE_USER", "pi")
+
+# Primary group of SERVICE_USER — derived by setup.sh via `id -gn` and passed
+# as GANTRY_SERVICE_GROUP.  Using the actual primary group name (rather than
+# assuming it equals the username) is important on systems where the two
+# differ (e.g. primary group is "users" or "staff").
+# Falls back to SERVICE_USER, which is correct on Raspberry Pi OS where user
+# private groups are enabled by default (user "rajes" → group "rajes").
+SERVICE_GROUP: str = os.environ.get("GANTRY_SERVICE_GROUP", SERVICE_USER)
 
 
 # ===========================================================================
@@ -332,17 +349,16 @@ def _write_device_conf(data: dict) -> None:
     conf_path: Path = DEVICE_CONF_PATH
 
     # Create /etc/vivarium/ if it does not exist yet.
-    # Permissions: 750 (root owns it, pi group can read/enter, world cannot).
+    # Permissions: 750 (root owns it, SERVICE_USER group can read/enter, world cannot).
     # The provisioner runs as root (via sudo / setup.sh), so we set the group
-    # to "pi" explicitly so that the bridge service (User=pi) can read the dir.
+    # to SERVICE_USER so that vivarium-bridge (User=SERVICE_USER) can read the dir.
     conf_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     try:
-        import shutil, grp
-        pi_gid = grp.getgrnam("pi").gr_gid
-        shutil.chown(conf_path.parent, user="root", group="pi")
+        import shutil, grp  # noqa: F401  (grp needed for getgrnam)
+        shutil.chown(conf_path.parent, user="root", group=SERVICE_GROUP)
         conf_path.parent.chmod(0o750)
-    except (KeyError, PermissionError, AttributeError):
-        # On a dev machine or in CI there is no "pi" group — skip chown.
+    except (ImportError, KeyError, PermissionError, AttributeError):
+        # On a dev machine or in CI there is no matching group — skip chown.
         pass
 
     parser = configparser.ConfigParser()
@@ -429,13 +445,18 @@ def _write_device_conf(data: dict) -> None:
     tmp_path.rename(conf_path)
 
     # Fix ownership: provisioner runs as root, but vivarium-bridge.service
-    # runs as User=pi.  Ensure pi can read device.conf.
+    # runs as User=SERVICE_USER (detected dynamically by setup.sh — not
+    # hardcoded to "pi").  Use the SERVICE_USER constant read from the
+    # GANTRY_SERVICE_USER env var that setup.sh writes into provisioner.env.
     try:
         import shutil as _shutil
-        _shutil.chown(conf_path, user="pi", group="pi")
-        logger.info("device.conf ownership set to pi:pi")
-    except (PermissionError, KeyError, AttributeError):
-        logger.debug("Could not chown device.conf to pi:pi (dev machine — skipping)")
+        _shutil.chown(conf_path, user=SERVICE_USER, group=SERVICE_GROUP)
+        logger.info("device.conf ownership set to %s:%s", SERVICE_USER, SERVICE_GROUP)
+    except (ImportError, PermissionError, KeyError, AttributeError):
+        logger.debug(
+            "Could not chown device.conf to %s:%s (dev machine — skipping)",
+            SERVICE_USER, SERVICE_GROUP,
+        )
 
     logger.info("device.conf written to %s (mode 600)", conf_path)
 
@@ -481,15 +502,19 @@ def _write_mediamtx_yaml(
     tmp_path.rename(output_path)
 
     # Fix ownership: provisioner runs as root (via setup.sh sudo) but
-    # vivarium-camera.service runs as User=pi.  Without chown the file is
+    # vivarium-camera.service runs as User=SERVICE_USER (detected dynamically
+    # by setup.sh — do not hardcode "pi").  Without chown the file is
     # root:root 600 and mediamtx gets "permission denied" on open().
     try:
         import shutil as _shutil
-        _shutil.chown(output_path, user="pi", group="pi")
-        logger.info("mediamtx.yaml ownership set to pi:pi")
-    except (PermissionError, KeyError, AttributeError):
-        # Dev machine / CI — no "pi" user; skip gracefully.
-        logger.debug("Could not chown mediamtx.yaml to pi:pi (dev machine — skipping)")
+        _shutil.chown(output_path, user=SERVICE_USER, group=SERVICE_GROUP)
+        logger.info("mediamtx.yaml ownership set to %s:%s", SERVICE_USER, SERVICE_GROUP)
+    except (ImportError, PermissionError, KeyError, AttributeError):
+        # Dev machine / CI — no such user; skip gracefully.
+        logger.debug(
+            "Could not chown mediamtx.yaml to %s:%s (dev machine — skipping)",
+            SERVICE_USER, SERVICE_GROUP,
+        )
 
     logger.info("mediamtx.yaml written to %s (mode 600)", output_path)
 
@@ -585,9 +610,8 @@ def main() -> None:
         sys.exit(1)
 
     # -- Step 5b: write mediamtx.yaml from template --------------------------
-    # BUG-15 FIX: rtsp_password must be present; an empty password would leave
-    # the RTSP stream unauthenticated. KeyError propagates to the outer
-    # except RuntimeError block and exits with code 1.
+    # rtsp_password must be present; an empty password would leave the RTSP
+    # stream unauthenticated.  Any error here is caught and exits cleanly.
     try:
         rtsp_password = result["rtsp_password"]
         if not rtsp_password:
@@ -596,10 +620,14 @@ def main() -> None:
                 "MediaMTX without a password. Check server provisioning logic."
             )
     except KeyError:
-        raise RuntimeError(
+        logger.error(
             "Server response missing 'rtsp_password' field — cannot configure "
             "MediaMTX. Check server provisioning endpoint."
         )
+        sys.exit(1)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
 
     # Pass mediamtx_port explicitly from the shared constant — do not rely
     # on the default parameter so that a future change to _MEDIAMTX_DEFAULT_PORT

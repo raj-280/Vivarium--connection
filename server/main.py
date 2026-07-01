@@ -41,8 +41,6 @@ from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
 from sqlalchemy.exc import IntegrityError
 
 from config.settings import settings
@@ -50,8 +48,6 @@ from db.database import create_tables, db_session
 from db.models import AuditLog, ImageRecord, Rack
 from core.locking import extend_lock, release_lock, start_lock_sweep_task
 from core.state import gantry_state
-# from middleware.csrf import CSRFMiddleware
-from middleware.rate_limit import limiter
 from services.mqtt_client import mqtt_client
 from services.cache import cache
 from services.s3_handler import ImagePathError, validate_image_path
@@ -647,9 +643,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     app.include_router(http_router)
     app.include_router(ws_router)

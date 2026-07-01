@@ -42,6 +42,7 @@ import json
 import logging
 import secrets
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -387,3 +388,80 @@ def _assign_device_id(db: Session) -> str:
                 pass
 
     return f"rack-{next_num:03d}"
+
+
+# ===========================================================================
+# Central MediaMTX path registration
+# ===========================================================================
+
+def register_path_on_central_mediamtx(
+    rack_id: str,
+    pi_ip: str,
+    pi_rtsp_port: int = 8554,
+) -> bool:
+    """
+    Hot-add a new rack's RTSP pull path to the central MediaMTX server
+    via the MediaMTX REST API.
+
+    Called from provision_device() after a Pi registers so the central
+    MediaMTX immediately knows to pull from that Pi on demand — no restart
+    required.
+
+    POST {MEDIAMTX_INTERNAL_URL}/v3/config/paths/add/{rack_id}
+    Body:
+        {
+            "source": "rtsp://{pi_ip}:{pi_rtsp_port}/{rack_id}",
+            "sourceOnDemand": true
+        }
+
+    Returns True on success, False on any failure (central server down,
+    MEDIAMTX_INTERNAL_URL not set, etc.).  Non-fatal — provisioning still
+    succeeds; the admin can manually add the path or restart MediaMTX.
+    """
+    base_url = settings.MEDIAMTX_INTERNAL_URL.strip()
+    if not base_url:
+        logger.debug(
+            "register_path_on_central_mediamtx: MEDIAMTX_INTERNAL_URL not set "
+            "— skipping hot-add for rack=%s", rack_id
+        )
+        return False
+
+    url = f"{base_url.rstrip('/')}/v3/config/paths/add/{rack_id}"
+    payload = {
+        "source": f"rtsp://{pi_ip}:{pi_rtsp_port}/{rack_id}",
+        "sourceOnDemand": True,
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            success = resp.status == 200
+            if success:
+                logger.info(
+                    "register_path_on_central_mediamtx: path %s registered "
+                    "(source=rtsp://%s:%d/%s)",
+                    rack_id, pi_ip, pi_rtsp_port, rack_id,
+                )
+            else:
+                logger.warning(
+                    "register_path_on_central_mediamtx: unexpected HTTP %d "
+                    "for rack=%s", resp.status, rack_id
+                )
+            return success
+    except OSError as exc:
+        logger.warning(
+            "register_path_on_central_mediamtx: central MediaMTX unreachable "
+            "(%s) — rack=%s will not be registered automatically", exc, rack_id
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "register_path_on_central_mediamtx: unexpected error for rack=%s: %s",
+            rack_id, exc
+        )
+        return False

@@ -68,7 +68,18 @@ interface CameraPanelProps {
 //   6. Client calls setRemoteDescription(answer).
 //   7. RTCPeerConnection fires ontrack — client attaches stream to video.srcObject.
 //
-// The hook tears down the RTCPeerConnection on unmount or when whepUrl changes.
+// FIX (Bug 7): ICE gather timeout reduced from 5s to 2s — on a LAN there are
+// no STUN candidates to wait for, so gathering completes almost instantly.
+// Sending a partial SDP after 5s just delays the error.
+//
+// FIX (Bug 8): sourceOnDemand retry — MediaMTX registers the path at startup
+// but the camera hardware only opens on the FIRST WHEP connection.  The first
+// attempt can fail with a 404/503 because MediaMTX hasn't opened the source
+// yet.  We retry up to MAX_WHEP_ATTEMPTS times with an exponential backoff
+// starting at WHEP_RETRY_BASE_MS so the camera has time to start.
+
+const MAX_WHEP_ATTEMPTS = 4;
+const WHEP_RETRY_BASE_MS = 1500; // doubles each attempt: 1.5s, 3s, 6s
 
 function useWhepStream(
   videoRef: React.RefObject<HTMLVideoElement>,
@@ -101,17 +112,20 @@ function useWhepStream(
 
     let cancelled = false;
 
-    const negotiate = async () => {
+    // FIX (Bug 8): retry loop so sourceOnDemand has time to open the camera.
+    const negotiate = async (attempt: number): Promise<void> => {
+      if (cancelled) return;
       teardown();
-      setStatus('connecting');
-      setError(null);
+      if (attempt === 1) {
+        setStatus('connecting');
+        setError(null);
+      }
 
       const pc = new RTCPeerConnection({
-        iceServers: [],  // LAN-only — no STUN/TURN needed on the same Wi-Fi
+        iceServers: [],  // LAN-only — no STUN/TURN needed
       });
       pcRef.current = pc;
 
-      // Add a recv-only transceiver for video; audio is optional.
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
 
@@ -136,14 +150,14 @@ function useWhepStream(
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Wait for ICE gathering to finish (gives MediaMTX a complete SDP)
+        // FIX (Bug 7): 2s ICE gather timeout instead of 5s.
+        // On a LAN there are no STUN candidates; gathering is near-instant.
         await new Promise<void>((resolve) => {
           if (pc.iceGatheringState === 'complete') { resolve(); return; }
           pc.onicegatheringstatechange = () => {
             if (pc.iceGatheringState === 'complete') resolve();
           };
-          // Safety timeout — proceed after 5s even if gathering is incomplete
-          setTimeout(resolve, 5000);
+          setTimeout(resolve, 2000); // FIX: was 5000
         });
 
         if (cancelled) return;
@@ -151,14 +165,24 @@ function useWhepStream(
         const sdpOffer = pc.localDescription?.sdp;
         if (!sdpOffer) throw new Error('Failed to generate SDP offer.');
 
-        // POST SDP offer to the WHEP endpoint
         const resp = await fetch(whepUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/sdp' },
           body: sdpOffer,
         });
 
+        // FIX (Bug 8): 404/503 = sourceOnDemand camera not open yet — retry.
         if (!resp.ok) {
+          if ((resp.status === 404 || resp.status === 503) && attempt < MAX_WHEP_ATTEMPTS) {
+            const delay = WHEP_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+            console.info(
+              `[useWhepStream] WHEP attempt ${attempt} got HTTP ${resp.status} — ` +
+              `camera starting up, retrying in ${delay}ms…`
+            );
+            teardown();
+            await new Promise(r => setTimeout(r, delay));
+            return negotiate(attempt + 1);
+          }
           throw new Error(
             `WHEP handshake failed: HTTP ${resp.status} from ${whepUrl}. ` +
             `Check that the Pi is online and MEDIAMTX_PI_HOST is set correctly.`
@@ -171,18 +195,26 @@ function useWhepStream(
         await pc.setRemoteDescription(
           new RTCSessionDescription({ type: 'answer', sdp: sdpAnswer })
         );
-        // ontrack fires after setRemoteDescription — setStatus('connected') there
+        // ontrack fires → setStatus('connected')
 
       } catch (err: unknown) {
         if (cancelled) return;
         const msg = err instanceof Error ? err.message : String(err);
+        // Retry on network errors too (camera may be opening)
+        if (attempt < MAX_WHEP_ATTEMPTS) {
+          const delay = WHEP_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+          console.info(`[useWhepStream] attempt ${attempt} failed (${msg}) — retrying in ${delay}ms…`);
+          teardown();
+          await new Promise(r => setTimeout(r, delay));
+          return negotiate(attempt + 1);
+        }
         setStatus('error');
         setError(msg);
         teardown();
       }
     };
 
-    negotiate();
+    negotiate(1);
 
     return () => {
       cancelled = true;
@@ -219,39 +251,47 @@ export function CameraPanel({ rackId, className }: CameraPanelProps) {
   const showMjpeg = !showWhep && Boolean(mjpegUrl);
   const hasStream = showWhep || showMjpeg;
 
-  // ── Listen for CAPTURE_STARTED and capture_complete on the global WS ──
+  // FIX (Bug 3): consolidated capture event handler — previously split into
+  // two separate blocks in the same useEffect which caused:
+  //   a) double timeout registration on every CAPTURE_STARTED
+  //   b) state never set to 'pending' from the first block
+  //   c) first block's timeout firing at 60s even after capture_complete
+  //      cleared the second block's timeout, because each block registered
+  //      its own independent timer.
+  // Now: one handler, one timer ref, one clear path.
+  //
+  // FIX (Bug 4): use addMessageListener/removeMessageListener instead of
+  // setOnMessage so this component doesn't stomp other WS listeners.
   useEffect(() => {
     const handler = (msg: WsMessage) => {
-      if (msg.type === 'status' && (msg.data as Record<string, unknown>)['CAPTURE_STARTED']) {
-        if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        timeoutRef.current = setTimeout(() => {
-          setCaptureState('error');
-          setCaptureError('Capture timed out — no response from Pi after 60s.');
-        }, appConfig.captureTimeoutMs);
-      }
+      const data = msg.data as Record<string, unknown>;
+      const raw = typeof data?.['raw'] === 'string' ? (data['raw'] as string) : '';
 
-      if (msg.type === 'capture_complete') {
-        if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        setCaptureState('success');
-        setTimeout(() => setCaptureState('idle'), 2500);
-      }
-
+      // CAPTURE_STARTED: set pending + arm the 60s safety timeout
       if (
-        msg.type === 'status' &&
-        typeof (msg.data as Record<string, unknown>)['raw'] === 'string' &&
-        ((msg.data as Record<string, unknown>)['raw'] as string).startsWith('CAPTURE_STARTED')
+        msg.type === 'capture_complete' ? false :
+        (msg.type === 'status' && (data['CAPTURE_STARTED'] || raw.startsWith('CAPTURE_STARTED')))
       ) {
         setCaptureState('pending');
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
         timeoutRef.current = setTimeout(() => {
           setCaptureState('error');
-          setCaptureError('Capture timed out (60s).');
+          setCaptureError('Capture timed out — no response from Pi after 60s.');
         }, appConfig.captureTimeoutMs);
+        return;
+      }
+
+      // capture_complete: clear timer, flash success
+      if (msg.type === 'capture_complete') {
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+        setCaptureState('success');
+        setTimeout(() => setCaptureState('idle'), 2500);
       }
     };
 
-    wsClient.setOnMessage(handler);
-    return () => {};
+    wsClient.addMessageListener(handler);
+    return () => wsClient.removeMessageListener(handler);
   }, []);
 
   useEffect(() => () => { if (timeoutRef.current) clearTimeout(timeoutRef.current); }, []);

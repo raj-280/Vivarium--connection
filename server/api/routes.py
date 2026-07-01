@@ -30,27 +30,20 @@ Both decorators are applied here; the Limiter is mounted in main.py.
 
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Request, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, status
+from jose import JWTError
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config.settings import settings
 from core.locking import LockResult, LockType, acquire_lock, release_lock
-from core.security import verify_password
-from core.security import create_access_token
+from core.security import create_access_token, decode_token, verify_password
 from db.database import db_session, get_db
 from db.models import Rack, User
-from middleware.auth import (
-    CurrentUser,
-    require_admin,
-    require_browser_user,
-    require_pi_api_key,
-    require_rack_operator,
-)
-from middleware.rate_limit import limit_commands, limit_presign
 from services.command_handler import CommandValidationError, handle_command
 from services.provisioning import ProvisionRequest, ProvisionResult, provision_device
 from services.streaming import broadcast_stream_url, broadcast_stream_close

@@ -231,14 +231,12 @@ export const SystemProvider = ({ children }: { children: React.ReactNode }) => {
         setMjpegUrl(msg.data.mjpeg_url ?? null);
         break;
 
-      // BUG FIX: stream_close was missing from the switch.
-      // Without this case, when the server broadcasts stream_close (on
-      // DELETE /lock, emergency stop, or lock-sweep expiry), the message
-      // fell through to `default` and did nothing.  streamUrl / mjpegUrl
-      // stayed set in React state, so CameraPanel kept trying to hold the
-      // WebRTC connection open on stale URLs — showing a frozen frame or a
-      // WebRTC error banner instead of the "Awaiting lock" placeholder.
-      case 'lock_released':
+      // FIX: The server (streaming.py → build_stream_close) sends
+      // { type: "stream_close" } on DELETE /lock, emergency stop, and
+      // lock-sweep expiry.  The previous case used 'lock_released' which
+      // the server never sends, so stream URLs were never cleared and
+      // CameraPanel kept trying to connect to a dead WebRTC endpoint.
+      case 'stream_close':
         setStreamUrl(null);
         setMjpegUrl(null);
         break;

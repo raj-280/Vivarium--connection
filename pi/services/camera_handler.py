@@ -325,7 +325,11 @@ class CameraHandler:
         Path pattern (matches server-side validation in s3_handler.py):
             {capture_dir}/{rack_id}/{YYYY-MM-DD}/{rack_id}-{timestamp}.jpg
 
-        Returns the full destination Path.
+        Note: capture_dir is already scoped to this device
+        (/var/vivarium/{device_id}/captures), so rack_id appears twice in the
+        full path.  This is intentional — the server parses rack_id from
+        within the path structure independently of the base capture_dir,
+        which may one day be a shared NAS mount.
 
         S3 branch (DORMANT):
             When batch_upload_enabled=true AND the server has S3_ENABLED=true,

@@ -7,7 +7,8 @@ The config file path is ALWAYS:
     /etc/vivarium/device.conf
 
 This is a permanent system path written ONCE by pi/provisioner.py on first
-boot (mode 600, owned pi:pi). It survives git pulls and redeployments.
+boot (mode 600, owned by the service user detected by setup.sh). It
+survives git pulls and redeployments.
 
 On a dev machine without a real Pi, create it manually:
     sudo mkdir -p /etc/vivarium
@@ -35,7 +36,8 @@ logger = logging.getLogger(__name__)
 # Permanent system path: /etc/vivarium/device.conf
 #
 # This file is written ONCE by pi/provisioner.py on first boot (mode 600,
-# owned root:pi) and then only read — never overwritten by a code update,
+# owned by the service user detected by setup.sh) and then only read —
+# never overwritten by a code update,
 # git pull, or redeploy.  Keeping it in /etc/ means the Pi's identity and
 # credentials survive the entire software lifecycle.
 #
@@ -99,10 +101,10 @@ _DEFAULTS: dict[str, dict[str, str]] = {
 
 class Settings:
     """
-    Typed view over pi/config/device.conf.
+    Typed view over /etc/vivarium/device.conf.
 
-    Automatically finds the config file at:
-        pi/config/device.conf   (same directory as this settings.py)
+    Config file is always read from:
+        /etc/vivarium/device.conf   (written once by provisioner.py on first boot)
 
     Group -> key mapping (Section 2.2):
       [identity]  device_id, cpu_serial
@@ -117,7 +119,7 @@ class Settings:
     def __init__(self, conf_path: Optional[str] = None) -> None:
         # conf_path is accepted only for unit tests that need to inject a
         # custom path. All production code leaves it None and gets the
-        # pi/config/device.conf path automatically via DEVICE_CONF_PATH.
+        # /etc/vivarium/device.conf path automatically via DEVICE_CONF_PATH.
         self.conf_path: str = conf_path if conf_path is not None else str(DEVICE_CONF_PATH)
 
         self._parser = configparser.ConfigParser()

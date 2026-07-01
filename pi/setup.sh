@@ -332,6 +332,8 @@ echo ""
 #      GANTRY_MQTT_BROKER         → written to device.conf [mqtt] broker_host
 #      GANTRY_SERVICE_USER        → used by provisioner.py for chown of
 #                                   device.conf and mediamtx.yaml
+#      GANTRY_SERVICE_GROUP       → primary group of SERVICE_USER (from id -gn),
+#                                   used alongside SERVICE_USER for chown
 #    File is mode 600 (root-only) and deleted immediately after step 10.
 #    The vivarium-provisioner.service EnvironmentFile line references this
 #    path with a leading "-" (optional) — it is only needed if the service
@@ -340,12 +342,15 @@ echo ""
 
 echo -e "${BLD}── Provisioning ───────────────────────────────────────────────────${RST}"
 
-cat > "${PROVISIONER_ENV}" << EOF
-GANTRY_SERVER_URL=${GANTRY_SERVER_URL}
-GANTRY_PROVISIONING_SECRET=${GANTRY_PROVISIONING_SECRET}
-GANTRY_MQTT_BROKER=${GANTRY_MQTT_BROKER}
-GANTRY_SERVICE_USER=${SERVICE_USER}
-EOF
+# Use printf for each line — prevents shell from expanding special characters
+# (e.g. '$', backticks) that may appear inside the provisioning secret.
+{
+    printf 'GANTRY_SERVER_URL=%s\n'          "${GANTRY_SERVER_URL}"
+    printf 'GANTRY_PROVISIONING_SECRET=%s\n' "${GANTRY_PROVISIONING_SECRET}"
+    printf 'GANTRY_MQTT_BROKER=%s\n'         "${GANTRY_MQTT_BROKER}"
+    printf 'GANTRY_SERVICE_USER=%s\n'        "${SERVICE_USER}"
+    printf 'GANTRY_SERVICE_GROUP=%s\n'       "${SERVICE_GROUP}"
+} > "${PROVISIONER_ENV}"
 chmod 600 "${PROVISIONER_ENV}"
 info "Temporary provisioner.env written (mode 600)"
 
@@ -364,6 +369,7 @@ info "Running provisioner.py..."
     export GANTRY_PROVISIONING_SECRET="${GANTRY_PROVISIONING_SECRET}"
     export GANTRY_MQTT_BROKER="${GANTRY_MQTT_BROKER}"
     export GANTRY_SERVICE_USER="${SERVICE_USER}"
+    export GANTRY_SERVICE_GROUP="${SERVICE_GROUP}"
     "${VENV_PYTHON}" "${SCRIPT_DIR}/provisioner.py"
 )
 ok "provisioner.py exited successfully"
@@ -413,6 +419,7 @@ else
         chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "/var/vivarium/${DEVICE_ID}"
     fi
     chmod 750 "/var/vivarium/${DEVICE_ID}"
+    chmod 750 "${CAPTURE_DIR}"
     ok "Capture directory created: ${CAPTURE_DIR}"
 fi
 

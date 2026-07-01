@@ -99,6 +99,22 @@ export interface WsMsgLockReleased {
 }
 
 /**
+ * stream_close — sent by the server when the rack lock is released,
+ * an emergency stop fires, or the lock-sweep daemon expires a lock.
+ *
+ * FIX: The server (streaming.py → build_stream_close) sends
+ * { type: "stream_close", data: { rack_id } }. The previous frontend
+ * code handled 'lock_released' instead of 'stream_close', so the
+ * stream URLs were never cleared and CameraPanel kept trying to connect
+ * to a dead WebRTC endpoint after every lock release.
+ */
+export interface WsMsgStreamClose {
+  type: 'stream_close';
+  rack_id?: string;
+  data: { rack_id?: string };
+}
+
+/**
  * capture_complete — routed only to the operator who holds the lock.
  * Viewers never receive this (Section 4.3).
  *
@@ -235,6 +251,25 @@ export interface WsMsgCommandAck {
   outcome: string;
 }
 
+/**
+ * response — raw MQTT "response" subtopic relay.
+ *
+ * FIX: The server forwards all MQTT response-subtopic payloads to the
+ * browser as { type: "response", data: <string|object> }. This message
+ * type was handled in SystemContext's switch statement but was missing
+ * from the WsMessage union, causing TypeScript to narrow `msg` to
+ * `never` inside `case 'response':` and flag `msg.data` as a red error.
+ *
+ * data is `string` for raw M114 position lines and plain ACK strings
+ * (e.g. "COMMAND_ACK:M700"), and a structured object for anything the
+ * server JSON-encodes before forwarding.
+ */
+export interface WsMsgResponse {
+  type: 'response';
+  rack_id?: string;
+  data: string | Record<string, unknown> | null;
+}
+
 /** Union of all server→browser message shapes */
 export type WsMessage =
   | WsMsgConnected
@@ -250,7 +285,9 @@ export type WsMessage =
   | WsMsgStreamUrl
   | WsMsgAlert
   | WsMsgScanResumePrompt
-  | WsMsgCommandAck;   // FIX (Mismatch 10): added
+  | WsMsgCommandAck
+  | WsMsgResponse     // FIX: added — resolves 'never' error in SystemContext case 'response'
+  | WsMsgStreamClose; // FIX: added — server sends stream_close on lock release / e-stop / sweep
 
 // ---------------------------------------------------------------------------
 // Browser → server WebSocket message shapes

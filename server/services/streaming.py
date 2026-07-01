@@ -168,20 +168,24 @@ def check_mediamtx_stream(rack_id: str) -> bool:
             logger.debug("check_mediamtx_stream: unexpected items type %r", type(items))
             return False
 
-        # BUG FIX 2: check 'ready' flag, not just path presence.
-        # With sourceOnDemand:true the path is registered immediately, but
-        # ready=false until a viewer connects and the camera hardware starts.
-        # Treating 'present' as 'online' masked an unplugged ribbon cable.
+        # FIX (Bug 1): treat path-present as "online" regardless of ready flag.
+        # With sourceOnDemand:true, ready=false until a viewer connects —
+        # which is always the case before the WHEP handshake.  Requiring
+        # ready=true here meant the probe always returned False on the first
+        # lock-acquire, generating a spurious warning every time.  The stream
+        # URL is issued anyway (probe is advisory), but the log noise was
+        # confusing.  mediamtx_health.py uses the same logic — path-present
+        # means MediaMTX is running and configured correctly; the camera opens
+        # on demand when the browser completes the WHEP handshake.
         for item in items:
             if not isinstance(item, dict):
                 continue
             if item.get("name", "") == rack_id:
-                ready = item.get("ready", False)
                 logger.debug(
-                    "check_mediamtx_stream: rack=%s found, ready=%s",
-                    rack_id, ready,
+                    "check_mediamtx_stream: rack=%s found (ready=%s) → online",
+                    rack_id, item.get("ready"),
                 )
-                return bool(ready)
+                return True  # path registered = MediaMTX up and configured
 
         logger.debug(
             "check_mediamtx_stream: rack=%s not found in paths=%s",

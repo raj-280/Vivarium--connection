@@ -429,9 +429,20 @@ class SerialHandler:
         # Drain any stale lines left over from a previous call (e.g. a late
         # arrival after a previous timeout) so they can't be misread as this
         # command's response.
-        while not self._response_queue.empty():
+        #
+        # FIX (jog wrong-movement after stop): a naive empty() check only
+        # drains what's already in the queue at this instant. A late Arduino
+        # reply to the PREVIOUS (interrupted) command can arrive a few ms
+        # later and still slip into this command's response window.
+        # We therefore drain with a short timed window (150 ms). This is
+        # safe because the new command hasn't been written to the wire yet
+        # (_serial.write() below), so NOTHING legitimate can arrive during
+        # this window — any line that shows up is by definition stale.
+        _drain_deadline = time.time() + 0.15
+        while True:
             try:
-                self._response_queue.get_nowait()
+                _stale = self._response_queue.get(timeout=max(0, _drain_deadline - time.time()))
+                logger.debug("_write_and_wait(%r): pre-write drain discarded stale %r", command.strip(), _stale)
             except queue.Empty:
                 break
 
@@ -487,12 +498,19 @@ class SerialHandler:
         for any acknowledgement from the Arduino.
 
         Called by bridge._on_emergency() instead of _forward_to_serial().
+
+        FIX (jog wrong-movement after stop): after flushing, we sleep 500 ms
+        and drain the response queue. This gives the Arduino time to finish
+        sending any in-flight reply to the interrupted command, so that reply
+        cannot race into the NEXT command's response window and be mistaken
+        for a valid response (which caused the gantry to move in the wrong
+        direction after a mid-jog stop).
         """
         self._estop.set()
         # Unblock any waiting send_command()
         with self._write_lock:
             self._waiting_for_response = False
-        self._response_queue.put("")  # sentinel: drained and discarded as noise
+        self._response_queue.put("")  # sentinel: wakes a blocked get()
 
         if self._serial and self._serial.is_open:
             try:
@@ -505,6 +523,25 @@ class SerialHandler:
                 logger.exception("emergency_stop: SerialException while writing !")
         else:
             logger.warning("emergency_stop: serial port not connected — ! not sent.")
+
+        # Give the Arduino time to finish emitting the response to the
+        # interrupted command, then discard everything in the queue.
+        # Without this pause, the late reply races into the next send_command()
+        # window and causes wrong movement.
+        time.sleep(0.5)
+        _drained = 0
+        while True:
+            try:
+                self._response_queue.get_nowait()
+                _drained += 1
+            except queue.Empty:
+                break
+        if _drained:
+            logger.debug("emergency_stop: drained %d stale item(s) from response queue.", _drained)
+
+        # Clear the flag so it can be used as a real guard in future (it is
+        # set again on the next emergency_stop() call).
+        self._estop.clear()
 
     # ── Health check ──────────────────────────────────────────────────────
 

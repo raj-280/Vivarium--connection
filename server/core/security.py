@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import bcrypt as _bcrypt_lib
-import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -122,109 +121,4 @@ def decode_token(token: str) -> TokenPayload:
     return TokenPayload(user_id=user_id, role=role)
 
 
-# ---------------------------------------------------------------------------
-# Static token validation
-# ---------------------------------------------------------------------------
 
-def is_valid_admin_token(token: str) -> bool:
-    """
-    Return True if *token* matches settings.ADMIN_TOKEN.
-
-    Uses a constant-time comparison to prevent timing attacks.
-    """
-    return secrets.compare_digest(token, settings.ADMIN_TOKEN)
-
-
-def is_valid_pi_api_key(key: str) -> bool:
-    """
-    Return True if *key* matches settings.PI_API_KEY.
-
-    PI_API_KEY is only accepted on /rack/{id}/presign — middleware/auth.py
-    enforces that restriction; this helper only checks the value.
-    """
-    return secrets.compare_digest(key, settings.PI_API_KEY)
-
-
-# ---------------------------------------------------------------------------
-# Role helpers
-# ---------------------------------------------------------------------------
-
-_VALID_ROLES = {"viewer", "operator", "admin"}
-
-
-def is_admin(role: str) -> bool:
-    """Admins bypass user_rack_assignments and have full write access."""
-    return role == "admin"
-
-
-def is_operator(role: str) -> bool:
-    """Operators can send commands to racks they are assigned to."""
-    return role == "operator"
-
-
-def is_viewer(role: str) -> bool:
-    """Viewers can only read state; they never receive capture_complete messages."""
-    return role == "viewer"
-
-
-def is_valid_role(role: str) -> bool:
-    """Return True if *role* is one of the three known roles."""
-    return role in _VALID_ROLES
-
-
-# ---------------------------------------------------------------------------
-# Rack-assignment check  (Section 3.3 / Section 4.2)
-# ---------------------------------------------------------------------------
-
-def user_has_rack_access(user_id: str, role: str, rack_id: str, db) -> bool:
-    """
-    Return True if the user may command / lock the given rack.
-
-    Rules (Section 3.3 / Section 4.2):
-    - admin  → always True (bypasses user_rack_assignments)
-    - viewer → always False (read-only; they use a separate read endpoint)
-    - operator → True only if a UserRackAssignment row exists for
-                 (user_id, rack_id)
-
-    *db* is a SQLAlchemy session.  The caller is responsible for managing its
-    lifetime (use the FastAPI db dependency or db_session context manager).
-    """
-    if is_admin(role):
-        return True
-    if is_viewer(role):
-        return False
-
-    # Operator path — check user_rack_assignments
-    from db.models import UserRackAssignment  # local import to avoid circular
-
-    row = (
-        db.query(UserRackAssignment)
-        .filter_by(user_id=user_id, rack_id=rack_id)
-        .first()
-    )
-    return row is not None
-
-
-# ---------------------------------------------------------------------------
-# Credential-type mismatch guard  (Section 4.2 / Section 9 Layer 2A)
-# ---------------------------------------------------------------------------
-
-def looks_like_mqtt_credential(value: str) -> bool:
-    """
-    Heuristic: an MQTT password is a 256-bit random hex string (64 hex chars)
-    generated during provisioning (Section 4.6).  The PI_API_KEY has the same
-    format, but it is the *same* static key for all Pis (stored in settings),
-    whereas per-Pi MQTT passwords are stored only in device.conf.
-
-    This function returns True if *value* is exactly 64 lowercase hex chars
-    AND it does NOT equal the configured PI_API_KEY.  That combination is
-    almost certainly a Pi's MQTT password being incorrectly presented to a
-    browser endpoint, and middleware/auth.py uses this to emit a 401 with an
-    explicit error rather than a generic "invalid credential".
-    """
-    if len(value) != 64:
-        return False
-    if not all(c in "0123456789abcdef" for c in value):
-        return False
-    # If it matches PI_API_KEY exactly it is a valid presign credential, not an MQTT one.
-    return not secrets.compare_digest(value, settings.PI_API_KEY)

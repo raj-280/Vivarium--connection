@@ -38,7 +38,8 @@ WorkingDirectory={{INSTALL_DIR}}
 #   GANTRY_SERVER_URL          — POST /provision target
 #   GANTRY_PROVISIONING_SECRET — authentication secret
 #   GANTRY_MQTT_BROKER         — written to device.conf [mqtt] broker_host
-#   GANTRY_SERVICE_USER        — chown target for device.conf and mediamtx.yaml
+#   GANTRY_SERVICE_USER        — chown target (user) for device.conf and mediamtx.yaml
+#   GANTRY_SERVICE_GROUP       — chown target (group) derived by setup.sh via id -gn
 #
 # setup.sh deletes this file after provisioning succeeds.
 # The leading "-" makes it optional — on every boot after the first the file
